@@ -7,7 +7,6 @@ RUN npm ci --omit=dev
 
 COPY public ./public
 COPY server ./server
-COPY README.md ./README.md
 
 EXPOSE 3000
 CMD ["npm", "start"]
