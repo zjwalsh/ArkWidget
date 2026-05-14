@@ -1,0 +1,60 @@
+{
+  "family": "ark-wxcc-widget",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/arkWxccWidgetTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "ark-wxcc-widget",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/ark-wxcc-widget:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "hostPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "3000" },
+        { "name": "WIDGET_BASE_PATH", "value": "/" },
+        { "name": "WIDGET_NAME", "value": "ark-widget" },
+        { "name": "WIDGET_PROVIDER", "value": "ArkWidget" },
+        { "name": "REQUIRE_AGENT_DESKTOP", "value": "true" },
+        { "name": "LOG_LEVEL", "value": "INFO" },
+        { "name": "POWERTOOLS_SERVICE_NAME", "value": "ark-wxcc-widget-host" },
+        { "name": "LOG_TO_FILE", "value": "false" },
+        { "name": "ARIES_API_TIMEOUT_MS", "value": "10000" },
+        { "name": "ARIES_NEW_CALL_ENDPOINT", "value": "/contact-arrivals" }
+      ],
+      "secrets": [
+        {
+          "name": "ARIES_API_BASE_URL",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/ark-widget/ARIES_API_BASE_URL"
+        },
+        {
+          "name": "ARIES_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/ark-widget/ARIES_API_KEY"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/ark-wxcc-widget",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      }
+    }
+  ]
+}

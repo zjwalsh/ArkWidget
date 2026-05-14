@@ -1,0 +1,23 @@
+{
+  "savedAt": "2026-05-12T21:45:45.725Z",
+  "endpoint": "/telephonic-signatures",
+  "commandType": null,
+  "metadata": {
+    "signatureAccepted": true,
+    "interactionId": "14516c97-fbfa-47c3-b8c4-06c41295fe1a"
+  },
+  "mimeType": "audio/webm;codecs=opus",
+  "sizeBytes": 47705,
+  "durationMs": 6446,
+  "source": {
+    "strategy": "srcObject",
+    "selector": "#remote-audio",
+    "tagName": "audio"
+  },
+  "signal": {
+    "averageRms": 0.011247,
+    "peak": 0.622572,
+    "activeSampleRatio": 0.2154,
+    "probablySilent": false
+  }
+}
