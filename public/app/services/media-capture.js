@@ -2,6 +2,7 @@ export class MediaCaptureService {
   constructor() {
     this.maxDurationMs = 30000;
     this.activeSession = null;
+    this.pendingCapture = null;
   }
 
   inspectAvailableSources() {
@@ -77,6 +78,10 @@ export class MediaCaptureService {
       throw new Error("An audio capture session is already in progress.");
     }
 
+    if (this.pendingCapture) {
+      throw new Error("A completed recording is waiting for confirm or cancel.");
+    }
+
     const source = await resolveCaptureSource(options);
     const mimeType = pickMimeType(options.mimeType);
     const recorder = new MediaRecorder(source.stream, mimeType ? { mimeType } : undefined);
@@ -132,7 +137,7 @@ export class MediaCaptureService {
     const audioBase64 = await blobToBase64(blob);
     const durationMs = Date.now() - startedAt;
 
-    return {
+    const completedCapture = {
       source: source.description,
       signal,
       fileName: options.fileName ?? startedOptions.fileName ?? buildFileName(blob.type),
@@ -144,17 +149,76 @@ export class MediaCaptureService {
       metadata: options.metadata ?? startedOptions.metadata ?? null,
       audioBase64
     };
+
+    this.pendingCapture = completedCapture;
+    return {
+      source: completedCapture.source,
+      signal: completedCapture.signal,
+      fileName: completedCapture.fileName,
+      mimeType: completedCapture.mimeType,
+      sizeBytes: completedCapture.sizeBytes,
+      durationMs: completedCapture.durationMs,
+      startedAt: completedCapture.startedAt,
+      stoppedAt: completedCapture.stoppedAt,
+      metadata: completedCapture.metadata,
+      awaitingConfirmation: true
+    };
+  }
+
+  cancelCapture() {
+    if (!this.pendingCapture) {
+      throw new Error("No completed recording is waiting to be discarded.");
+    }
+
+    const discardedCapture = this.pendingCapture;
+    this.pendingCapture = null;
+
+    return {
+      discarded: true,
+      fileName: discardedCapture.fileName ?? null,
+      durationMs: discardedCapture.durationMs ?? null,
+      metadata: discardedCapture.metadata ?? null
+    };
+  }
+
+  confirmCapture(options = {}) {
+    if (!this.pendingCapture) {
+      throw new Error("No completed recording is waiting for confirmation.");
+    }
+
+    const captureToConfirm = this.pendingCapture;
+    this.pendingCapture = null;
+    const metadata = options.metadata ?? captureToConfirm.metadata ?? null;
+
+    return {
+      ...captureToConfirm,
+      fileName: options.fileName ?? captureToConfirm.fileName ?? null,
+      metadata,
+      confirmedAt: new Date().toISOString()
+    };
   }
 
   getCaptureStatus() {
     if (!this.activeSession) {
-      return {
-        recording: false
-      };
+      return this.pendingCapture
+        ? {
+          recording: false,
+          awaitingConfirmation: true,
+          fileName: this.pendingCapture.fileName ?? null,
+          metadata: this.pendingCapture.metadata ?? null,
+          startedAt: this.pendingCapture.startedAt ?? null,
+          stoppedAt: this.pendingCapture.stoppedAt ?? null,
+          durationMs: this.pendingCapture.durationMs ?? null
+        }
+        : {
+          recording: false,
+          awaitingConfirmation: false
+        };
     }
 
     return {
       recording: true,
+      awaitingConfirmation: false,
       startedAt: new Date(this.activeSession.startedAt).toISOString(),
       source: this.activeSession.source.description,
       fileName: this.activeSession.options.fileName ?? null,

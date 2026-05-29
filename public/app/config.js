@@ -8,6 +8,7 @@ export function getWidgetConfig() {
     sdkScriptPath: config.sdkScriptPath ?? "./vendor/@wxcc-desktop/sdk/dist/index.js",
     ariesForwardPath: config.ariesForwardPath ?? "/api/third-party/forward",
     ariesNewCallEndpoint: config.ariesNewCallEndpoint ??  "/contact-arrivals",
+    ariesRecordTransactionEndpoint: config.ariesRecordTransactionEndpoint ?? "/recordtransaction",
     commandStreamPath: config.commandStreamPath ?? "/events",
     desktopRegistrationPath: config.desktopRegistrationPath ?? "/api/desktop-client",
     requireAgentDesktop: config.requireAgentDesktop ?? true

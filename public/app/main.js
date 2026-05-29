@@ -55,21 +55,15 @@ async function bootstrap() {
       showCommand({ registrationError: error.message });
     }
 
-    if (isNewCallEvent(event)) {
+    if (isCallLifecycleEvent(event)) {
       try {
-        await handleNewCallArrival(event);
+        await handleCallLifecycleEvent(event);
       } catch (error) {
-        showCommand({ newCallWebhookError: error.message });
+        showCommand({ callLifecycleWebhookError: error.message });
       }
     }
 
-    try {
-      await ariesApi.sendAgentEvent(event);
-      updateStatus("Agent Desktop data forwarding active");
-    } catch (error) {
-      updateStatus("Forwarding failed");
-      showCommand({ forwardingError: error.message });
-    }
+    updateStatus("Agent Desktop monitoring active");
   });
 
   commandStream.connect({
@@ -97,7 +91,7 @@ async function bootstrap() {
         });
 
         if (
-          (resolvedCommand?.type === "captureAudioSnippet" || resolvedCommand?.type === "stopAudioCapture")
+          (resolvedCommand?.type === "captureAudioSnippet" || resolvedCommand?.type === "confirmAudioCapture")
           && resolvedCommand?.payload?.delivery
         ) {
           const deliveryResponse = await ariesApi.sendCapturedAudio(resolvedCommand, result);
@@ -143,8 +137,7 @@ async function bootstrap() {
         payload: wxccClient.getAgentSnapshot()
       };
       showDesktopEvent(snapshot);
-      await ariesApi.sendAgentEvent(snapshot);
-      updateStatus("Manual snapshot forwarded");
+      updateStatus("Manual snapshot captured locally");
     },
     onSimulate: async () => {
       const command = {
@@ -262,19 +255,24 @@ async function syncDesktopRouting(event) {
   desktopRoutingState.skippedIdentityKey = null;
 }
 
-async function handleNewCallArrival(event) {
-  await ariesApi.sendNewCallEvent({
+async function handleCallLifecycleEvent(event) {
+  const payload = {
     ...event,
     detectedAt: new Date().toISOString()
-  });
+  };
+
+  await Promise.all([
+    ariesApi.sendNewCallEvent(payload),
+    ariesApi.sendRecordTransactionEvent(payload)
+  ]);
 }
 
-function isNewCallEvent(event) {
+function isCallLifecycleEvent(event) {
   if (event?.source !== "sdk" || event?.type !== "agent-contact") {
     return false;
   }
 
-  if (event.eventName !== "eAgentOfferContact") {
+  if (!["eAgentOfferContact", "eAgentContactEnded"].includes(event.eventName)) {
     return false;
   }
 
@@ -532,9 +530,11 @@ function enrichCommandWithCurrentInteraction(command) {
 
 function shouldInjectInteractionId(command) {
   return [
+    "updateCadVariables",
     "captureAudioSnippet",
     "startAudioCapture",
-    "stopAudioCapture"
+    "stopAudioCapture",
+    "confirmAudioCapture"
   ].includes(command?.type);
 }
 
@@ -581,7 +581,7 @@ function summarizeCommandResultForDisplay(command, result) {
     return limitDisplayText(result);
   }
 
-  if (["captureAudioSnippet", "stopAudioCapture"].includes(command?.type)) {
+  if (["captureAudioSnippet", "stopAudioCapture", "confirmAudioCapture"].includes(command?.type)) {
     const { audioBase64, ...rest } = result;
     return {
       ...rest,

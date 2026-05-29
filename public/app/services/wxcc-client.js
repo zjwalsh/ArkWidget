@@ -92,6 +92,8 @@ export class WxccClient {
         return this.startOutdial(payload);
       case "conference":
         return this.startConference(payload);
+      case "updateCadVariables":
+        return this.updateCadVariables(payload);
       case "inspectMediaCapture":
         return this.inspectMediaCapture();
       case "captureAudioSnippet":
@@ -100,6 +102,10 @@ export class WxccClient {
         return this.startAudioCapture(payload);
       case "stopAudioCapture":
         return this.stopAudioCapture(payload);
+      case "confirmAudioCapture":
+        return this.confirmAudioCapture(payload);
+      case "cancelAudioCapture":
+        return this.cancelAudioCapture();
       case "getAudioCaptureStatus":
         return this.getAudioCaptureStatus();
       case "hold":
@@ -204,6 +210,14 @@ export class WxccClient {
     return this.desktop.agentContact.consultConference(payload);
   }
 
+  async updateCadVariables(payload) {
+    if (typeof this.desktop.dialer?.updateCadVariables !== "function") {
+      throw new Error("WXCC dialer.updateCadVariables is not available in this runtime.");
+    }
+
+    return this.desktop.dialer.updateCadVariables(payload);
+  }
+
   async inspectMediaCapture() {
     return this.mediaCapture.inspectAvailableSources();
   }
@@ -218,6 +232,14 @@ export class WxccClient {
 
   async stopAudioCapture(payload) {
     return this.mediaCapture.stopCapture(payload);
+  }
+
+  confirmAudioCapture(payload) {
+    return this.mediaCapture.confirmCapture(payload);
+  }
+
+  cancelAudioCapture() {
+    return this.mediaCapture.cancelCapture();
   }
 
   getAudioCaptureStatus() {

@@ -33,6 +33,74 @@ The widget now requires the actual Webex Contact Center Agent Desktop runtime. O
 
 4. Open `http://localhost:3000`.
 
+## HTTPS with Tailscale
+
+If you are seeing browser or WXCC certificate errors on Linux, the immediate cause is usually that the app is only being served over plain HTTP or with a certificate that does not match the Tailscale hostname.
+
+The widget host now defaults its runtime API and SDK URLs to same-origin paths. That avoids a common reverse-proxy failure mode where `/config.js` accidentally emits `http://localhost:3000/...` or another internal origin even though the page itself was loaded through Funnel over HTTPS.
+
+Use one of these two patterns:
+
+### Option 1: Let Tailscale terminate HTTPS
+
+Keep the Node app on local HTTP and have Tailscale expose it on your tailnet with a valid HTTPS certificate for your device hostname.
+
+Start the app normally:
+
+```bash
+npm run dev
+```
+
+Then publish it through Tailscale:
+
+```bash
+sudo tailscale serve --https=443 http://127.0.0.1:3000
+```
+
+Use the resulting MagicDNS URL such as `https://your-host.your-tailnet.ts.net/desktop.js` in Webex Contact Center instead of `http://localhost:3000/desktop.js`.
+
+This is the simplest deployment because Tailscale owns the certificate lifecycle and the Node process stays unchanged behind the proxy.
+
+If your proxy setup still does not preserve the public hostname correctly, force it explicitly:
+
+```bash
+PUBLIC_ORIGIN=https://your-host.your-tailnet.ts.net npm run dev
+sudo tailscale funnel 3000
+```
+
+That makes `/config.js` emit absolute URLs pinned to the Funnel hostname instead of relying on forwarded headers.
+
+### Option 2: Run Node with a Tailscale-issued cert
+
+If you want this process to terminate TLS directly, first fetch a cert for the device's Tailscale DNS name:
+
+```bash
+sudo tailscale cert your-host.your-tailnet.ts.net
+```
+
+That command writes a `.crt` and `.key` file locally. Start the app with those paths:
+
+```bash
+HTTPS_CERT_PATH=/var/lib/tailscale/certs/your-host.your-tailnet.ts.net.crt \
+HTTPS_KEY_PATH=/var/lib/tailscale/certs/your-host.your-tailnet.ts.net.key \
+PORT=3000 \
+npm start
+```
+
+The server entrypoint now detects `HTTPS_CERT_PATH` and `HTTPS_KEY_PATH` and starts HTTPS instead of HTTP. `TAILSCALE_CERT_PATH` and `TAILSCALE_KEY_PATH` are also accepted if you prefer those variable names.
+
+If you also want the generated runtime URLs pinned to a specific hostname, set:
+
+```bash
+PUBLIC_ORIGIN=https://your-host.your-tailnet.ts.net
+```
+
+Important constraints:
+
+- The certificate must match the exact hostname you browse to, usually your MagicDNS name ending in `.ts.net`.
+- Browsing to an IP address or `localhost` with a Tailscale cert will still fail hostname validation.
+- For WXCC, point the desktop `script` URL at the HTTPS Tailscale hostname, for example `https://your-host.your-tailnet.ts.net/desktop.js`.
+
 ## Targeting Actual Agent Desktop
 
 For a real Webex Contact Center Desktop deployment, set:
@@ -120,12 +188,22 @@ POWERTOOLS_SERVICE_NAME=ark-wxcc-widget-host
 LOG_TO_FILE=false
 LOG_FILE_PATH=./logs/server.log
 ARIES_API_BASE_URL=https://api.example.com
+ARIES_API_UPLOAD_URL=https://api.example.com
 ARIES_API_KEY=replace-me
 ARIES_API_TIMEOUT_MS=10000
 ARIES_NEW_CALL_ENDPOINT=/contact-arrivals
+ARIES_RECORD_TRANSACTION_ENDPOINT=/recordtransaction
+ARIES_CONSENT_RECORDING_FIELD_NAME=JW_Aries_consentRecComp
+ARIES_CONSENT_SCRIPT_PLAYED_FIELD_NAME=JW_Aries_consentScrPlayedSw
+ARIES_COMMAND_USERNAME=aries-user
+ARIES_COMMAND_PASSWORD=replace-me
 ```
 
 Legacy `THIRD_PARTY_*` names are still accepted for backward compatibility, but new config should use `ARIES_*`.
+
+When both `ARIES_COMMAND_USERNAME` and `ARIES_COMMAND_PASSWORD` are set, inbound commands to `/api/desktop-command` require HTTP Basic authentication. Requests without valid credentials are rejected with `401 Unauthorized`.
+
+When `ARIES_CONSENT_RECORDING_FIELD_NAME` and/or `ARIES_CONSENT_SCRIPT_PLAYED_FIELD_NAME` are configured, the server inspects incoming event JSON for a nested `callAssociatedData` object, extracts those configured field names server-side, logs the received payload, and forwards the resolved values to Aries as a top-level `trackedCallAssociatedData` object.
 
 ## Logging
 
@@ -205,8 +283,8 @@ Avoid logging secrets such as `ARIES_API_KEY`, auth headers, or full unsanitized
 ## Important notes
 
 - The `$Store` contract can vary by desktop version and custom widget runtime. This scaffold treats it as an optional source and safely degrades to SDK-derived state.
-- The command mapper currently supports a controlled set of actions such as notifications, state changes, hold/unhold, end contact, and DTMF.
-- The command mapper currently supports notifications, state changes, outbound dialing, consult conference, hold/unhold, end contact, and DTMF.
+- The command mapper currently supports a controlled set of actions such as notifications, state changes, hold/unhold, end contact, DTMF, CAD updates, and recording confirm/cancel.
+- The command mapper currently supports notifications, state changes, outbound dialing, consult conference, hold/unhold, end contact, DTMF, CAD updates, and recording confirm/cancel.
 - Runtime mistakes are surfaced immediately because the widget no longer has a standalone mock mode.
 - For AWS Amplify hosting, the static `public/` app can stay largely unchanged. The Node relay layer would typically move behind API Gateway, Lambda, ECS, or another backend service.
 
@@ -319,6 +397,7 @@ POST a command into the local host:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "notification",
@@ -334,6 +413,7 @@ Trigger a state change:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "stateChange",
@@ -348,6 +428,7 @@ Start a consult conference:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "conference",
@@ -367,6 +448,7 @@ Start a new outbound call:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "startOutdial",
@@ -389,10 +471,37 @@ curl -X POST http://localhost:3000/api/desktop-command \
 
 The `startOutdial` payload is passed directly to `Desktop.dialer.startOutdial(...)`. In practice, Aries must provide the exact dialer payload expected by your WXCC tenant configuration. In the tested WebRTC flow, `payload.data.direction` is the outbound ANI configuration UUID, not the entry point UUID. `payload.data.origin` is optional and can be omitted for WebRTC agents. The widget still rejects the literal placeholder `AGENT_DN` if it is sent.
 
+Update CAD variables on the current interaction:
+
+```bash
+curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "updateCadVariables",
+    "agentId": "AGENT_ID",
+    "payload": {
+      "interactionId": "INTERACTION_ID",
+      "data": {
+        "attributes": {
+          "key": "JW_Aries_consentScrPlayedSw",
+          "value": "true"
+        }
+      },
+      "secureCad": [],
+      "keyId": null,
+      "keyVersion": null
+    }
+  }'
+```
+
+The `updateCadVariables` payload is passed directly to `Desktop.dialer.updateCadVariables(...)`. If Aries omits `payload.interactionId`, the widget will inject the current active interaction ID when one is available from the desktop runtime.
+
 Inspect whether the widget can see any recordable WebRTC media source:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "inspectMediaCapture",
@@ -404,6 +513,7 @@ Capture a short audio snippet from a visible audio or video element and post it 
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
+  -u "${ARIES_COMMAND_USERNAME}:${ARIES_COMMAND_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "captureAudioSnippet",
@@ -439,6 +549,10 @@ When `payload.delivery` is present, the browser records the clip locally, base64
     "caseId": "ABC-123",
     "interactionId": "INTERACTION_ID"
   },
+  "trackedCallAssociatedData": {
+    "consentRecordingComplete": true,
+    "consentScriptPlayed": true
+  },
   "audio": {
     "fileName": "telephonic-signature.webm",
     "mimeType": "audio/webm",
@@ -471,15 +585,34 @@ curl -X POST http://localhost:3000/api/desktop-command \
   }'
 ```
 
-If `payload.metadata.interactionId` is omitted on `captureAudioSnippet`, `startAudioCapture`, or `stopAudioCapture`, the widget now fills it automatically from the current live call when one is available.
+If `payload.metadata.interactionId` is omitted on `captureAudioSnippet`, `startAudioCapture`, `stopAudioCapture`, or `confirmAudioCapture`, the widget now fills it automatically from the current live call when one is available.
 
-Stop the recording session and post the captured segment to Aries as JSON:
+Stop the recording session and keep the captured segment pending locally until Aries confirms it:
 
 ```bash
 curl -X POST http://localhost:3000/api/desktop-command \
   -H "Content-Type: application/json" \
   -d '{
     "type": "stopAudioCapture",
+    "agentId": "AGENT_ID",
+    "payload": {
+      "metadata": {
+        "memberId": "123456789",
+        "caseId": "ABC-123",
+        "interactionId": "INTERACTION_ID",
+        "signatureAccepted": true
+      }
+    }
+  }'
+```
+
+Confirm the pending recording and upload it to Aries:
+
+```bash
+curl -X POST http://localhost:3000/api/desktop-command \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "confirmAudioCapture",
     "agentId": "AGENT_ID",
     "payload": {
       "metadata": {
@@ -500,6 +633,17 @@ curl -X POST http://localhost:3000/api/desktop-command \
   }'
 ```
 
+Discard the pending recording without uploading it:
+
+```bash
+curl -X POST http://localhost:3000/api/desktop-command \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "cancelAudioCapture",
+    "agentId": "AGENT_ID"
+  }'
+```
+
 Check whether a session is currently active:
 
 ```bash
@@ -511,4 +655,4 @@ curl -X POST http://localhost:3000/api/desktop-command \
   }'
 ```
 
-Only one capture session is tracked at a time inside the widget. `startAudioCapture` keeps audio chunks in memory until `stopAudioCapture` is received. The `stopAudioCapture` payload can override or extend the metadata collected at start, and if a `delivery` block is present the final base64 audio payload is posted directly to Aries. When no Aries base URL is configured, that same payload is written to `logs/recordings/` as an audio file plus a sidecar metadata JSON file.
+Only one capture session is tracked at a time inside the widget. `startAudioCapture` keeps audio chunks in memory until `stopAudioCapture` is received. After stop, the completed clip remains pending inside the widget until Aries sends either `confirmAudioCapture` or `cancelAudioCapture`. Only `confirmAudioCapture` uploads the recording, and the browser still sends its captured base64 payload to the middleware. The middleware now transcodes that payload to real WAV with `ffmpeg` immediately before forwarding it to Aries via `ARIES_API_UPLOAD_URL` or, if unset, `ARIES_API_BASE_URL`. When neither URL is configured, the transcoded WAV payload is written to `logs/recordings/` as a local file plus a sidecar metadata JSON file.

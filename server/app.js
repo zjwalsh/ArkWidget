@@ -1,4 +1,5 @@
 import express from "express";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,12 +15,25 @@ const widgetAssetVersion = Date.now().toString();
 
 export function createArkWidgetApp(options = {}) {
   const mountPath = normalizeMountPath(options.mountPath ?? process.env.WIDGET_BASE_PATH ?? "/");
+  const publicOrigin = normalizePublicOrigin(options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? "");
   const ariesBaseUrl = options.ariesBaseUrl
     ?? process.env.ARIES_API_BASE_URL
+    ?? "";
+  const ariesUploadUrl = options.ariesUploadUrl
+    ?? process.env.ARIES_API_UPLOAD_URL
     ?? "";
   const ariesApiKey = options.ariesApiKey
     ?? process.env.ARIES_API_KEY
     ?? "";
+  const ariesCommandUsername = normalizeOptionalString(
+    options.ariesCommandUsername
+    ?? process.env.ARIES_COMMAND_USERNAME
+  );
+  const ariesCommandPassword = normalizeOptionalString(
+    options.ariesCommandPassword
+    ?? process.env.ARIES_COMMAND_PASSWORD
+  );
+  const requiresCommandAuth = Boolean(ariesCommandUsername || ariesCommandPassword);
   const ariesTimeoutMs = Number.parseInt(
     String(
       options.ariesTimeoutMs
@@ -31,6 +45,22 @@ export function createArkWidgetApp(options = {}) {
   const ariesNewCallEndpoint = options.ariesNewCallEndpoint
     ?? process.env.ARIES_NEW_CALL_ENDPOINT
     ?? "/contact-arrivals";
+  const ariesRecordTransactionEndpoint = options.ariesRecordTransactionEndpoint
+    ?? process.env.ARIES_RECORD_TRANSACTION_ENDPOINT
+    ?? "/recordtransaction";
+  const trackedCallAssociatedDataFields = buildTrackedCallAssociatedDataFields({
+    consentRecordingFieldName: options.ariesConsentRecordingFieldName
+      ?? process.env.ARIES_CONSENT_RECORDING_FIELD_NAME,
+    consentScriptPlayedFieldName: options.ariesConsentScriptPlayedFieldName
+      ?? process.env.ARIES_CONSENT_SCRIPT_PLAYED_FIELD_NAME
+  });
+  const trackedCallAssociatedDataState = {
+    byInteractionId: new Map(),
+    latestTrackedCallAssociatedData: null
+  };
+  const callLifecycleState = {
+    callStartTimeByInteractionId: new Map()
+  };
 
 
   const requireAgentDesktop = toBoolean(options.requireAgentDesktop ?? process.env.REQUIRE_AGENT_DESKTOP, true);
@@ -88,19 +118,20 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.get("/config.js", (request, response) => {
-    const requestOrigin = getRequestOrigin(request);
+    const runtimeOrigin = publicOrigin || getRequestOrigin(request);
     const config = {
       widgetName: options.widgetName ?? process.env.WIDGET_NAME ?? "ark-widget",
       widgetProvider: options.widgetProvider ?? process.env.WIDGET_PROVIDER ?? "ArkWidget",
       basePath: mountPath,
       assetVersion: widgetAssetVersion,
-      sdkScriptPath: toAbsoluteUrl(requestOrigin, joinMountPath(mountPath, "/vendor/@wxcc-desktop/sdk/dist/index.js")),
-      ariesForwardPath: toAbsoluteUrl(requestOrigin, joinMountPath(mountPath, "/api/third-party/forward")),
+      sdkScriptPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/vendor/@wxcc-desktop/sdk/dist/index.js")),
+      ariesForwardPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/third-party/forward")),
       ariesNewCallEndpoint,
-      thirdPartyForwardPath: toAbsoluteUrl(requestOrigin, joinMountPath(mountPath, "/api/third-party/forward")),
+      ariesRecordTransactionEndpoint,
+      thirdPartyForwardPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/third-party/forward")),
       thirdPartyNewCallEndpoint: ariesNewCallEndpoint,
-      commandStreamPath: toAbsoluteUrl(requestOrigin, joinMountPath(mountPath, "/events")),
-      desktopRegistrationPath: toAbsoluteUrl(requestOrigin, joinMountPath(mountPath, "/api/desktop-client")),
+      commandStreamPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/events")),
+      desktopRegistrationPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/desktop-client")),
       requireAgentDesktop
     };
 
@@ -109,6 +140,7 @@ export function createArkWidgetApp(options = {}) {
     logDebug("Served widget config", {
       ...buildRequestContext(request),
       mountPath,
+      publicOrigin: publicOrigin || undefined,
       requireAgentDesktop
     });
   });
@@ -199,6 +231,33 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.post("/api/desktop-command", (request, response) => {
+    if (requiresCommandAuth) {
+      const commandAuthResult = validateCommandBasicAuth({
+        request,
+        expectedUsername: ariesCommandUsername,
+        expectedPassword: ariesCommandPassword
+      });
+
+      if (!commandAuthResult.ok) {
+        if (commandAuthResult.reason === "missing-command-auth-config") {
+          logError("Desktop command auth misconfigured", {
+            ...buildRequestContext(request),
+            reason: commandAuthResult.reason
+          });
+          response.status(500).json({ error: "Inbound command authentication is misconfigured." });
+          return;
+        }
+
+        logWarn("Desktop command rejected", {
+          ...buildRequestContext(request),
+          reason: commandAuthResult.reason
+        });
+        response.setHeader("WWW-Authenticate", "Basic realm=\"ark-widget-desktop-command\"");
+        response.status(401).json({ error: "Unauthorized." });
+        return;
+      }
+    }
+
     const command = request.body;
 
     if (!command || typeof command.type !== "string") {
@@ -236,36 +295,7 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.post("/api/third-party/forward", async (request, response) => {
-    if (!ariesBaseUrl) {
-      const savedRecording = await maybePersistCapturedAudio({
-        body: request.body,
-        recordingsDir,
-        requestId: request.requestId
-      });
-      const savedCommandResult = await maybePersistCommandResult({
-        body: request.body,
-        commandResultsDir,
-        requestId: request.requestId
-      });
-
-      logWarn("Aries forward skipped", {
-        ...buildRequestContext(request),
-        endpoint: request.body?.endpoint ?? null,
-        reason: "missing-aries-base-url",
-        savedRecordingPath: savedRecording?.audioFilePath ?? null,
-        savedCommandResultPath: savedCommandResult?.filePath ?? null
-      });
-      response.status(202).json({
-        mocked: true,
-        message: "ARIES_API_BASE_URL is not configured. Request was not forwarded.",
-        request: request.body ?? null,
-        savedRecording,
-        savedCommandResult
-      });
-      return;
-    }
-
-    const { endpoint = "/", method = "POST", body, headers = {} } = request.body ?? {};
+    const { endpoint = "/", method = "POST", body, headers = {}, useUploadApi = false } = request.body ?? {};
 
     if (typeof endpoint !== "string" || !endpoint.startsWith("/")) {
       logWarn("Aries forward rejected", {
@@ -277,7 +307,98 @@ export function createArkWidgetApp(options = {}) {
       return;
     }
 
-    const url = new URL(endpoint, ariesBaseUrl);
+    const trackedForwardContext = resolveTrackedCallAssociatedDataContext({
+      body,
+      trackedFieldDefinitions: trackedCallAssociatedDataFields,
+      trackedState: trackedCallAssociatedDataState
+    });
+    const transformedBody = shouldTransformCallLifecyclePayload(endpoint, [
+      ariesNewCallEndpoint,
+      ariesRecordTransactionEndpoint
+    ])
+      ? buildAriesNewCallPayload({
+        body: trackedForwardContext.forwardBody,
+        trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
+        callLifecycleState
+      })
+      : trackedForwardContext.forwardBody;
+    let finalForwardBody = transformedBody;
+
+    if (useUploadApi) {
+      try {
+        finalForwardBody = await transcodeUploadPayloadToWav(transformedBody);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown audio transcoding error.";
+
+        logError("Aries upload transcoding failed", {
+          ...buildRequestContext(request),
+          endpoint,
+          method,
+          error
+        });
+        response.status(502).json({ error: `Audio transcoding failed: ${message}` });
+        return;
+      }
+    }
+
+    const forwardRequest = {
+      ...request.body,
+      endpoint,
+      method,
+      headers,
+      useUploadApi,
+      body: finalForwardBody
+    };
+
+    logInfo("Aries forward payload received", {
+      ...buildRequestContext(request),
+      endpoint,
+      method,
+      useUploadApi,
+      interactionId: trackedForwardContext.interactionId,
+      trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
+      extractedTrackedCallAssociatedData: trackedForwardContext.extractedTrackedCallAssociatedData,
+      body: sanitizeForwardBodyForLog(forwardRequest.body)
+    });
+
+    const destinationBaseUrl = useUploadApi && ariesUploadUrl
+      ? ariesUploadUrl
+      : ariesBaseUrl;
+
+    if (!destinationBaseUrl) {
+      const savedRecording = await maybePersistCapturedAudio({
+        body: forwardRequest,
+        recordingsDir,
+        requestId: request.requestId
+      });
+      const savedCommandResult = await maybePersistCommandResult({
+        body: forwardRequest,
+        commandResultsDir,
+        requestId: request.requestId
+      });
+
+      logWarn("Aries forward skipped", {
+        ...buildRequestContext(request),
+        endpoint,
+        reason: useUploadApi ? "missing-aries-upload-url" : "missing-aries-base-url",
+        savedRecordingPath: savedRecording?.audioFilePath ?? null,
+        savedCommandResultPath: savedCommandResult?.filePath ?? null,
+        interactionId: trackedForwardContext.interactionId,
+        trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData
+      });
+      response.status(202).json({
+        mocked: true,
+        message: useUploadApi
+          ? "ARIES_API_UPLOAD_URL is not configured. Request was not forwarded."
+          : "ARIES_API_BASE_URL is not configured. Request was not forwarded.",
+        request: forwardRequest,
+        savedRecording,
+        savedCommandResult
+      });
+      return;
+    }
+
+    const url = resolveAriesUrl(destinationBaseUrl, endpoint);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ariesTimeoutMs);
     const startedAt = Date.now();
@@ -297,7 +418,7 @@ export function createArkWidgetApp(options = {}) {
           ...(ariesApiKey ? { authorization: `Bearer ${ariesApiKey}` } : {}),
           ...headers
         },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: finalForwardBody === undefined ? undefined : JSON.stringify(finalForwardBody),
         signal: controller.signal
       });
 
@@ -355,6 +476,420 @@ export function joinMountPath(basePath, routePath) {
   return normalizedBasePath === "/"
     ? normalizedRoutePath
     : `${normalizedBasePath}${normalizedRoutePath}`;
+}
+
+export function resolveAriesUrl(baseUrl, endpoint) {
+  const resolvedBaseUrl = new URL(baseUrl);
+  const resolvedEndpointUrl = new URL(endpoint, "https://ark-widget.invalid");
+
+  resolvedBaseUrl.pathname = joinMountPath(resolvedBaseUrl.pathname, resolvedEndpointUrl.pathname);
+  resolvedBaseUrl.search = resolvedEndpointUrl.search;
+  resolvedBaseUrl.hash = resolvedEndpointUrl.hash;
+  return resolvedBaseUrl;
+}
+
+function shouldTransformCallLifecyclePayload(endpoint, lifecycleEndpoints) {
+  const normalizedEndpoint = normalizeOptionalString(endpoint);
+
+  if (!normalizedEndpoint) {
+    return false;
+  }
+
+  return lifecycleEndpoints
+    .map((value) => normalizeOptionalString(value))
+    .filter(Boolean)
+    .includes(normalizedEndpoint);
+}
+
+function buildTrackedCallAssociatedDataFields({ consentRecordingFieldName, consentScriptPlayedFieldName }) {
+  return [
+    {
+      outputKey: "consentRecordingComplete",
+      fieldName: normalizeOptionalString(consentRecordingFieldName)
+    },
+    {
+      outputKey: "consentScriptPlayed",
+      fieldName: normalizeOptionalString(consentScriptPlayedFieldName)
+    }
+  ].filter((definition) => Boolean(definition.fieldName));
+}
+
+export function resolveTrackedCallAssociatedDataContext({ body, trackedFieldDefinitions, trackedState }) {
+  if (!Array.isArray(trackedFieldDefinitions) || trackedFieldDefinitions.length === 0) {
+    return {
+      interactionId: resolveInteractionId(body),
+      extractedTrackedCallAssociatedData: null,
+      trackedCallAssociatedData: null,
+      forwardBody: body
+    };
+  }
+
+  const interactionId = resolveInteractionId(body);
+  const extractedTrackedCallAssociatedData = extractTrackedCallAssociatedData(body, trackedFieldDefinitions);
+  const trackedByInteraction = interactionId
+    ? trackedState?.byInteractionId?.get?.(interactionId) ?? null
+    : null;
+  const mergedTrackedCallAssociatedData = mergeTrackedCallAssociatedData(
+    trackedByInteraction,
+    extractedTrackedCallAssociatedData
+  );
+
+  if (interactionId && hasTrackedCallAssociatedData(mergedTrackedCallAssociatedData)) {
+    trackedState.byInteractionId.set(interactionId, mergedTrackedCallAssociatedData);
+    trackedState.latestTrackedCallAssociatedData = {
+      interactionId,
+      values: mergedTrackedCallAssociatedData
+    };
+  } else if (hasTrackedCallAssociatedData(extractedTrackedCallAssociatedData)) {
+    trackedState.latestTrackedCallAssociatedData = {
+      interactionId,
+      values: extractedTrackedCallAssociatedData
+    };
+  }
+
+  const trackedCallAssociatedData = hasTrackedCallAssociatedData(mergedTrackedCallAssociatedData)
+    ? mergedTrackedCallAssociatedData
+    : interactionId
+      ? trackedByInteraction
+      : trackedState?.latestTrackedCallAssociatedData?.values ?? null;
+
+  return {
+    interactionId,
+    extractedTrackedCallAssociatedData,
+    trackedCallAssociatedData,
+    forwardBody: attachTrackedCallAssociatedData(body, trackedCallAssociatedData)
+  };
+}
+
+function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
+  const callAssociatedData = findFirstNestedObjectByNormalizedKey(body, "callassociateddata");
+
+  if (!callAssociatedData) {
+    return null;
+  }
+
+  const extracted = trackedFieldDefinitions.reduce((result, definition) => {
+    const fieldValue = readCallAssociatedDataValue(callAssociatedData, definition.fieldName);
+
+    if (fieldValue !== null) {
+      result[definition.outputKey] = fieldValue;
+    }
+
+    return result;
+  }, {});
+
+  return Object.keys(extracted).length > 0 ? extracted : null;
+}
+
+function readCallAssociatedDataValue(callAssociatedData, fieldName) {
+  if (!fieldName || !callAssociatedData || typeof callAssociatedData !== "object") {
+    return null;
+  }
+
+  const value = callAssociatedData[fieldName];
+
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  if (typeof value === "object" && !Array.isArray(value) && "value" in value) {
+    return normalizeTrackedFieldValue(value.value);
+  }
+
+  return normalizeTrackedFieldValue(value);
+}
+
+function normalizeTrackedFieldValue(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "object") {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  return value;
+}
+
+function mergeTrackedCallAssociatedData(existingValues, nextValues) {
+  if (!hasTrackedCallAssociatedData(existingValues)) {
+    return hasTrackedCallAssociatedData(nextValues) ? { ...nextValues } : null;
+  }
+
+  if (!hasTrackedCallAssociatedData(nextValues)) {
+    return { ...existingValues };
+  }
+
+  return {
+    ...existingValues,
+    ...nextValues
+  };
+}
+
+function hasTrackedCallAssociatedData(value) {
+  return Boolean(value) && Object.keys(value).length > 0;
+}
+
+function attachTrackedCallAssociatedData(body, trackedCallAssociatedData) {
+  if (!hasTrackedCallAssociatedData(trackedCallAssociatedData) || !body || typeof body !== "object") {
+    return body;
+  }
+
+  return {
+    ...body,
+    trackedCallAssociatedData
+  };
+}
+
+function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecycleState }) {
+  const eventData = body?.payload?.data ?? {};
+  const interaction = eventData?.interaction ?? {};
+  const callProcessingDetails = interaction?.callProcessingDetails ?? {};
+  const eventName = normalizeOptionalString(body?.eventName);
+  const interactionId = normalizeOptionalString(interaction?.interactionId);
+  const eventTime = eventData?.eventTime ?? null;
+  const isStartEvent = eventName === "eAgentOfferContact";
+  const isEndEvent = eventName === "eAgentContactEnded";
+  const knownCallStartTime = interactionId
+    ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
+    : null;
+
+  if (interactionId && isStartEvent && eventTime !== null) {
+    callLifecycleState?.callStartTimeByInteractionId?.set?.(interactionId, eventTime);
+  }
+
+  return {
+    transactionId: interactionId,
+    userEmail: normalizeOptionalString(eventData?.agentEmailId),
+    loginId: normalizeOptionalString(eventData?.agentId),
+    loginName: normalizeOptionalString(eventData?.agentEmailId),
+    callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
+    callStartTime: isStartEvent ? eventTime : knownCallStartTime,
+    callEndTime: isEndEvent ? eventTime : null,
+    consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
+    consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
+  };
+}
+
+function resolveInteractionId(body) {
+  return pickFirstString([
+    body?.interactionId,
+    body?.payload?.interactionId,
+    body?.payload?.data?.interactionId,
+    body?.payload?.interaction?.interactionId,
+    body?.payload?.data?.interaction?.interactionId,
+    body?.metadata?.interactionId,
+    body?.command?.payload?.interactionId,
+    body?.command?.payload?.metadata?.interactionId,
+    body?.result?.metadata?.interactionId,
+    ...findNestedValuesByNormalizedKey(body, "interactionid")
+  ]);
+}
+
+function sanitizeForwardBodyForLog(body) {
+  return JSON.parse(JSON.stringify(body, (key, value) => {
+    if (key === "base64" && typeof value === "string") {
+      return `[base64 ${value.length} chars]`;
+    }
+
+    if (typeof value === "string" && value.length > 4000) {
+      return `${value.slice(0, 4000)}...[${value.length - 4000} more chars]`;
+    }
+
+    return value;
+  }));
+}
+
+function findNestedValuesByNormalizedKey(input, normalizedKey) {
+  const matches = [];
+  const seen = new WeakSet();
+
+  walk(input, 0);
+  return matches;
+
+  function walk(value, depth) {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (seen.has(value) || depth > 8) {
+      return;
+    }
+
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item, depth + 1));
+      return;
+    }
+
+    Object.entries(value).forEach(([key, currentValue]) => {
+      if (normalizeKeyName(key) === normalizedKey) {
+        const normalizedValue = normalizeOptionalString(currentValue);
+
+        if (normalizedValue) {
+          matches.push(normalizedValue);
+        }
+      }
+
+      walk(currentValue, depth + 1);
+    });
+  }
+}
+
+function findFirstNestedObjectByNormalizedKey(input, normalizedKey) {
+  const seen = new WeakSet();
+  return walk(input, 0);
+
+  function walk(value, depth) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    if (seen.has(value) || depth > 8) {
+      return null;
+    }
+
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const match = walk(item, depth + 1);
+
+        if (match) {
+          return match;
+        }
+      }
+
+      return null;
+    }
+
+    for (const [key, currentValue] of Object.entries(value)) {
+      if (normalizeKeyName(key) === normalizedKey && currentValue && typeof currentValue === "object") {
+        return currentValue;
+      }
+
+      const nestedMatch = walk(currentValue, depth + 1);
+
+      if (nestedMatch) {
+        return nestedMatch;
+      }
+    }
+
+    return null;
+  }
+}
+
+function pickFirstString(values) {
+  for (const value of values) {
+    const normalizedValue = normalizeOptionalString(value);
+
+    if (normalizedValue) {
+      return normalizedValue;
+    }
+  }
+
+  return null;
+}
+
+function normalizeKeyName(value) {
+  return String(value).replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function normalizeOptionalString(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  return String(value);
+}
+
+function validateCommandBasicAuth({ request, expectedUsername, expectedPassword }) {
+  if (!expectedUsername || !expectedPassword) {
+    return {
+      ok: false,
+      reason: "missing-command-auth-config"
+    };
+  }
+
+  const headerValue = request.get("authorization");
+
+  if (!headerValue || !headerValue.toLowerCase().startsWith("basic ")) {
+    return {
+      ok: false,
+      reason: "missing-basic-auth"
+    };
+  }
+
+  const encodedCredentials = headerValue.slice(6).trim();
+
+  if (!encodedCredentials) {
+    return {
+      ok: false,
+      reason: "missing-basic-auth"
+    };
+  }
+
+  let decodedCredentials = null;
+
+  try {
+    decodedCredentials = Buffer.from(encodedCredentials, "base64").toString("utf8");
+  } catch {
+    return {
+      ok: false,
+      reason: "invalid-basic-auth"
+    };
+  }
+
+  const separatorIndex = decodedCredentials.indexOf(":");
+
+  if (separatorIndex < 0) {
+    return {
+      ok: false,
+      reason: "invalid-basic-auth"
+    };
+  }
+
+  const suppliedUsername = decodedCredentials.slice(0, separatorIndex);
+  const suppliedPassword = decodedCredentials.slice(separatorIndex + 1);
+
+  if (suppliedUsername !== expectedUsername || suppliedPassword !== expectedPassword) {
+    return {
+      ok: false,
+      reason: "invalid-credentials"
+    };
+  }
+
+  return {
+    ok: true,
+    reason: null
+  };
+}
+
+function normalizeAriesFieldValue(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    const trimmedValue = value.trim();
+
+    if (trimmedValue === "") {
+      return null;
+    }
+
+    if (trimmedValue.toLowerCase() === "true") {
+      return true;
+    }
+
+    if (trimmedValue.toLowerCase() === "false") {
+      return false;
+    }
+
+    return trimmedValue;
+  }
+
+  return value;
 }
 
 function normalizeMountPath(input) {
@@ -468,190 +1003,87 @@ function buildDesktopBootstrapScript(configPath, entryPath) {
   var templateMarkup = ${JSON.stringify(`
   <style>
     :host {
-      width: min(100%, 960px);
-      display: block;
+      width: fit-content;
+      max-width: 100%;
+      display: inline-block;
       color: #102a43;
     }
 
     .shell {
-      border: 1px solid rgba(16, 42, 67, 0.08);
-      border-radius: 28px;
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      border: 1px solid rgba(16, 42, 67, 0.1);
+      border-radius: 999px;
       overflow: hidden;
-      background: rgba(255, 255, 255, 0.82);
-      backdrop-filter: blur(18px);
-      box-shadow: 0 24px 60px rgba(16, 42, 67, 0.14);
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(240, 247, 252, 0.92));
+      backdrop-filter: blur(14px);
+      box-shadow: 0 14px 32px rgba(16, 42, 67, 0.12);
     }
 
     .hero {
-      padding: 24px;
-      background:
-        linear-gradient(135deg, rgba(16, 42, 67, 0.96), rgba(19, 118, 180, 0.92)),
-        linear-gradient(45deg, #102a43, #1376b4);
-      color: white;
-    }
-
-    .eyebrow {
-      text-transform: uppercase;
-      letter-spacing: 0.18em;
-      font-size: 12px;
-      opacity: 0.72;
-      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 12px 14px 12px 18px;
+      color: #102a43;
     }
 
     h1 {
       margin: 0;
-      font-size: clamp(28px, 5vw, 42px);
+      font-size: 15px;
       line-height: 1;
-      font-weight: 700;
-    }
-
-    .hero p {
-      margin: 12px 0 0;
-      max-width: 60ch;
-      color: rgba(255, 255, 255, 0.86);
-    }
-
-    .content {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 16px;
-      padding: 20px;
-    }
-
-    .panel {
-      border-radius: 20px;
-      padding: 18px;
-      background: linear-gradient(180deg, rgba(250, 251, 252, 0.95), rgba(239, 244, 248, 0.9));
-      border: 1px solid rgba(19, 118, 180, 0.12);
-      min-height: 200px;
-    }
-
-    .panel h2 {
-      margin: 0 0 12px;
-      font-size: 14px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: #486581;
+      font-weight: 800;
+      letter-spacing: 0.02em;
     }
 
     .status {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 7px 11px;
       border-radius: 999px;
-      font-size: 13px;
-      font-weight: 600;
-      background: rgba(239, 164, 45, 0.18);
-      color: #8d5d00;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      background: rgba(19, 118, 180, 0.12);
+      color: #0f5f92;
+      width: fit-content;
+      max-width: 100%;
+      white-space: nowrap;
     }
 
     .status::before {
       content: "";
-      width: 8px;
-      height: 8px;
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
       background: currentColor;
+      box-shadow: 0 0 0 3px rgba(15, 95, 146, 0.14);
     }
 
-    pre {
-      margin: 0;
-      overflow: auto;
-      font-size: 12px;
-      line-height: 1.5;
-      white-space: pre-wrap;
-      word-break: break-word;
-      color: #243b53;
-    }
+    @media (max-width: 520px) {
+      .shell {
+        display: flex;
+        width: 100%;
+        border-radius: 24px;
+      }
 
-    button {
-      border: 0;
-      border-radius: 14px;
-      background: #102a43;
-      color: white;
-      font: inherit;
-      padding: 10px 14px;
-      cursor: pointer;
-    }
+      .hero {
+        width: 100%;
+        align-items: flex-start;
+      }
 
-    .actions {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin-top: 16px;
-    }
-
-    .identifier-grid {
-      display: grid;
-      gap: 12px;
-    }
-
-    .identifier-row {
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(16, 42, 67, 0.04);
-      border: 1px solid rgba(16, 42, 67, 0.08);
-    }
-
-    .identifier-label {
-      display: block;
-      margin-bottom: 6px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: #486581;
-    }
-
-    .identifier-value {
-      margin: 0;
-      font-size: 12px;
-      line-height: 1.5;
-      color: #102a43;
-      white-space: pre-wrap;
-      word-break: break-word;
+      .status {
+        white-space: normal;
+      }
     }
   </style>
   <section class="shell">
     <div class="hero">
-      <div class="eyebrow">Cisco Webex Contact Center</div>
       <h1>Ark Desktop Bridge</h1>
-      <p>Consumes Agent Desktop state, relays data to your third-party service, and executes commands returned into the WXCC SDK.</p>
-    </div>
-    <div class="content">
-      <article class="panel">
-        <h2>Connection</h2>
-        <div class="status" id="status">Initializing</div>
-        <div class="actions">
-          <button id="sync">Send Snapshot</button>
-          <button id="simulate">Simulate Notification</button>
-        </div>
-      </article>
-      <article class="panel">
-        <h2>Latest Desktop Event</h2>
-        <pre id="event">Waiting for Agent Desktop data...</pre>
-      </article>
-      <article class="panel">
-        <h2>Latest Command</h2>
-        <pre id="command">Waiting for third-party commands...</pre>
-      </article>
-      <article class="panel">
-        <h2>Live Identifiers</h2>
-        <div class="identifier-grid">
-          <div class="identifier-row">
-            <span class="identifier-label">Agent ID</span>
-            <pre class="identifier-value" id="agent-id">Waiting for live events...</pre>
-          </div>
-          <div class="identifier-row">
-            <span class="identifier-label">Task IDs</span>
-            <pre class="identifier-value" id="task-ids">Waiting for live events...</pre>
-          </div>
-          <div class="identifier-row">
-            <span class="identifier-label">Interaction IDs</span>
-            <pre class="identifier-value" id="interaction-ids">Waiting for live events...</pre>
-          </div>
-        </div>
-      </article>
+      <div class="status" id="status">Initializing</div>
     </div>
   </section>
   `)};
@@ -791,19 +1223,9 @@ function buildDesktopBootstrapScript(configPath, entryPath) {
       render() {
         this.shadowRoot.innerHTML = templateMarkup;
         this.statusElement = this.shadowRoot.getElementById("status");
-        this.eventElement = this.shadowRoot.getElementById("event");
-        this.commandElement = this.shadowRoot.getElementById("command");
-        this.agentIdElement = this.shadowRoot.getElementById("agent-id");
-        this.taskIdsElement = this.shadowRoot.getElementById("task-ids");
-        this.interactionIdsElement = this.shadowRoot.getElementById("interaction-ids");
-        this.syncButton = this.shadowRoot.getElementById("sync");
-        this.simulateButton = this.shadowRoot.getElementById("simulate");
       }
 
-      bindControls() {
-        this.syncButton.onclick = () => this.handleSync && this.handleSync();
-        this.simulateButton.onclick = () => this.handleSimulate && this.handleSimulate();
-      }
+      bindControls() {}
 
       setHandlers(handlers) {
         this.handleSync = handlers.onSync;
@@ -815,18 +1237,14 @@ function buildDesktopBootstrapScript(configPath, entryPath) {
       }
 
       showDesktopEvent(event) {
-        this.eventElement.textContent = formatData(event);
+        this.latestEventText = formatData(event);
       }
 
       showCommand(command) {
-        this.commandElement.textContent = formatData(command);
+        this.latestCommandText = formatData(command);
       }
 
-      showIdentifiers(identifiers) {
-        this.agentIdElement.textContent = identifiers && identifiers.agentId ? identifiers.agentId : "Not available yet";
-        this.taskIdsElement.textContent = formatIdentifierList(identifiers && identifiers.taskIds);
-        this.interactionIdsElement.textContent = formatIdentifierList(identifiers && identifiers.interactionIds);
-      }
+      showIdentifiers(_identifiers) {}
     }
 
     customElements.define("sa-ds-sdk", ArkDesktopWidget);
@@ -840,8 +1258,20 @@ function getRequestOrigin(request) {
   return `${protocol}://${host}`;
 }
 
-function toAbsoluteUrl(origin, routePath) {
+function toRuntimeUrl(origin, routePath) {
+  if (!origin) {
+    return routePath;
+  }
+
   return new URL(routePath, `${origin}/`).href;
+}
+
+function normalizePublicOrigin(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().replace(/\/$/, "");
 }
 
 async function maybePersistCapturedAudio({ body, recordingsDir, requestId }) {
@@ -892,6 +1322,21 @@ async function maybePersistCapturedAudio({ body, recordingsDir, requestId }) {
 }
 
 function extractCapturePayload(forwardRequestBody) {
+  const directDocBlob = forwardRequestBody?.body?.docBlob;
+
+  if (typeof directDocBlob === "string" && directDocBlob.length > 0) {
+    return {
+      base64: directDocBlob,
+      fileName: buildUploadedRecordingFileName(forwardRequestBody?.body),
+      mimeType: inferUploadMimeType(forwardRequestBody?.body?.fileType),
+      sizeBytes: null,
+      durationMs: null,
+      metadata: sanitizeUploadMetadata(forwardRequestBody?.body),
+      source: null,
+      signal: null
+    };
+  }
+
   const directAudio = forwardRequestBody?.body?.audio;
 
   if (directAudio?.base64) {
@@ -923,6 +1368,111 @@ function extractCapturePayload(forwardRequestBody) {
   }
 
   return null;
+}
+
+async function transcodeUploadPayloadToWav(body) {
+  if (!body || typeof body !== "object" || typeof body.docBlob !== "string" || body.docBlob.length === 0) {
+    return body;
+  }
+
+  const inputBuffer = Buffer.from(body.docBlob, "base64");
+
+  if (isWavBuffer(inputBuffer)) {
+    return {
+      ...body,
+      fileType: "WAV"
+    };
+  }
+
+  const wavBuffer = await transcodeAudioBufferToWav(inputBuffer);
+
+  return {
+    ...body,
+    docBlob: wavBuffer.toString("base64"),
+    fileType: "WAV"
+  };
+}
+
+async function transcodeAudioBufferToWav(inputBuffer) {
+  return await new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-acodec",
+      "pcm_s16le",
+      "-f",
+      "wav",
+      "pipe:1"
+    ]);
+    const stdoutChunks = [];
+    const stderrChunks = [];
+
+    ffmpeg.stdout.on("data", (chunk) => {
+      stdoutChunks.push(chunk);
+    });
+
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderrChunks.push(chunk);
+    });
+
+    ffmpeg.on("error", (error) => {
+      reject(new Error(`ffmpeg process failed to start: ${error.message}`));
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(stdoutChunks));
+        return;
+      }
+
+      const stderrOutput = Buffer.concat(stderrChunks).toString("utf8").trim();
+      reject(new Error(stderrOutput || `ffmpeg exited with code ${code}`));
+    });
+
+    ffmpeg.stdin.on("error", () => {});
+    ffmpeg.stdin.end(inputBuffer);
+  });
+}
+
+function isWavBuffer(buffer) {
+  return Buffer.isBuffer(buffer)
+    && buffer.length >= 12
+    && buffer.subarray(0, 4).toString("ascii") === "RIFF"
+    && buffer.subarray(8, 12).toString("ascii") === "WAVE";
+}
+
+function buildUploadedRecordingFileName(uploadBody) {
+  const dialogId = normalizeOptionalString(uploadBody?.dialogId) ?? crypto.randomUUID();
+  const fileType = normalizeOptionalString(uploadBody?.fileType)?.toLowerCase() ?? "wav";
+
+  return `${sanitizeFileStem(dialogId)}.${fileType}`;
+}
+
+function inferUploadMimeType(fileType) {
+  const normalizedFileType = normalizeOptionalString(fileType)?.toLowerCase();
+
+  if (normalizedFileType === "wav") {
+    return "audio/wav";
+  }
+
+  if (normalizedFileType === "mp3") {
+    return "audio/mpeg";
+  }
+
+  return null;
+}
+
+function sanitizeUploadMetadata(uploadBody) {
+  if (!uploadBody || typeof uploadBody !== "object") {
+    return null;
+  }
+
+  const { docBlob, ...metadata } = uploadBody;
+  return metadata;
 }
 
 function pickAudioExtension(mimeType, fileName) {

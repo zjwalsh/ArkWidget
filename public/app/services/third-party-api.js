@@ -2,6 +2,7 @@ export class AriesApiClient {
   constructor(config) {
     this.forwardPath = config.ariesForwardPath;
     this.newCallEndpoint = config.ariesNewCallEndpoint ?? "/contact-arrivals";
+    this.recordTransactionEndpoint = config.ariesRecordTransactionEndpoint ?? "/recordtransaction";
   }
 
   async sendAgentEvent(event) {
@@ -32,6 +33,14 @@ export class AriesApiClient {
     });
   }
 
+  async sendRecordTransactionEvent(event) {
+    return this.forward({
+      endpoint: this.recordTransactionEndpoint,
+      method: "POST",
+      body: event
+    });
+  }
+
   async sendCapturedAudio(command, captureResult) {
     const delivery = command?.payload?.delivery ?? {};
     const endpoint = typeof delivery.endpoint === "string" && delivery.endpoint.startsWith("/")
@@ -41,17 +50,23 @@ export class AriesApiClient {
     const extraBody = isPlainObject(delivery.extraBody) ? delivery.extraBody : {};
     const metadata = isPlainObject(captureResult?.metadata) ? captureResult.metadata : {};
     const body = {
-      ...extraBody,
-      metadata,
-      captureSource: captureResult?.source ?? null,
-      captureSignal: captureResult?.signal ?? null,
-      audio: {
-        fileName: captureResult?.fileName ?? null,
-        mimeType: captureResult?.mimeType ?? null,
-        sizeBytes: captureResult?.sizeBytes ?? null,
-        durationMs: captureResult?.durationMs ?? null,
-        base64: captureResult?.audioBase64 ?? null
-      }
+      dialogId: firstNonEmptyValue(metadata.dialogId, metadata.interactionId),
+      docTypeId: metadata.docTypeId ?? 1026,
+      docTypeName: firstNonEmptyValue(metadata.docTypeName, "Telephonic Signature Recording"),
+      receivedDt: firstNonEmptyValue(metadata.receivedDt, formatTodayDate()),
+      scanDt: firstNonEmptyValue(metadata.scanDt, formatTodayDate()),
+      caseNum: firstNonEmptyValue(metadata.caseNum),
+      appNum: firstNonEmptyValue(metadata.appNum),
+      indvId: firstNonEmptyValue(metadata.indvId),
+      source: firstNonEmptyValue(metadata.source, "FIN"),
+      lastName: firstNonEmptyValue(metadata.lastName),
+      firstName: firstNonEmptyValue(metadata.firstName),
+      midName: firstNonEmptyValue(metadata.midName),
+      suffix: firstNonEmptyValue(metadata.suffix, metadata.sufxName),
+      dob: firstNonEmptyValue(metadata.dob, metadata.dobDt),
+      docBlob: captureResult?.audioBase64 ?? null,
+      fileType: firstNonEmptyValue(metadata.fileType, "WAV"),
+      ...extraBody
     };
 
     if (delivery.includeCommand === true) {
@@ -61,6 +76,7 @@ export class AriesApiClient {
     return this.forward({
       endpoint,
       method,
+      useUploadApi: command?.type === "confirmAudioCapture",
       body
     });
   }
@@ -84,6 +100,22 @@ export class AriesApiClient {
 
     return data ?? text;
   }
+}
+
+function firstNonEmptyValue(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+
+    return value;
+  }
+
+  return null;
+}
+
+function formatTodayDate() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function isPlainObject(value) {
