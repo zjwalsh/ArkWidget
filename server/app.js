@@ -61,10 +61,31 @@ export function createArkWidgetApp(options = {}) {
   const callLifecycleState = {
     callStartTimeByInteractionId: new Map()
   };
+  const orphanClientMaxAgeMs = Number.parseInt(
+    String(
+      options.orphanClientMaxAgeMs
+      ?? process.env.DESKTOP_ORPHAN_CLIENT_MAX_AGE_MS
+      ?? "60000"
+    ),
+    10
+  );
+  const orphanClientSweepIntervalMs = Number.parseInt(
+    String(
+      options.orphanClientSweepIntervalMs
+      ?? process.env.DESKTOP_ORPHAN_CLIENT_SWEEP_INTERVAL_MS
+      ?? "15000"
+    ),
+    10
+  );
 
 
   const requireAgentDesktop = toBoolean(options.requireAgentDesktop ?? process.env.REQUIRE_AGENT_DESKTOP, true);
   const sseClients = new Set();
+  const orphanClientSweep = startOrphanClientSweep({
+    clients: sseClients,
+    maxAgeMs: orphanClientMaxAgeMs,
+    sweepIntervalMs: orphanClientSweepIntervalMs
+  });
   const router = express.Router();
 
   router.use((request, response, next) => {
@@ -162,9 +183,11 @@ export function createArkWidgetApp(options = {}) {
     const client = {
       id: crypto.randomUUID(),
       response,
+      connectedAt: Date.now(),
       agentId: null,
       agentAliases: [],
-      taskIds: []
+      taskIds: [],
+      interactionIds: []
     };
     sseClients.add(client);
     logInfo("Desktop command stream connected", {
@@ -186,7 +209,7 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.post("/api/desktop-client", (request, response) => {
-    const { clientId, agentId = null, agentAliases = [], taskIds = [] } = request.body ?? {};
+    const { clientId, agentId = null, agentAliases = [], taskIds = [], interactionIds = [] } = request.body ?? {};
 
     if (typeof clientId !== "string" || !clientId) {
       logWarn("Desktop client registration rejected", {
@@ -212,13 +235,15 @@ export function createArkWidgetApp(options = {}) {
     client.agentId = normalizeIdentityValue(agentId);
     client.agentAliases = normalizeIdentityList(agentAliases);
     client.taskIds = normalizeTaskIds(taskIds);
+    client.interactionIds = normalizeIdentityList(interactionIds);
 
     logInfo("Desktop client registered", {
       ...buildRequestContext(request),
       clientId: client.id,
       agentId: client.agentId,
       agentAliases: client.agentAliases,
-      taskIds: client.taskIds
+      taskIds: client.taskIds,
+      interactionIds: client.interactionIds
     });
 
     response.json({
@@ -226,7 +251,24 @@ export function createArkWidgetApp(options = {}) {
       clientId: client.id,
       agentId: client.agentId,
       agentAliases: client.agentAliases,
-      taskIds: client.taskIds
+      taskIds: client.taskIds,
+      interactionIds: client.interactionIds
+    });
+  });
+
+  router.get("/api/desktop-clients", (request, response) => {
+    const connectedClients = listConnectedClientIdentities(sseClients);
+
+    logInfo("Connected desktop clients listed", {
+      ...buildRequestContext(request),
+      connectedClients: connectedClients.length,
+      connectedClientIdentities: connectedClients
+    });
+
+    response.json({
+      ok: true,
+      connectedClients: connectedClients.length,
+      clients: connectedClients
     });
   });
 
@@ -270,12 +312,7 @@ export function createArkWidgetApp(options = {}) {
     }
 
     const targetClients = selectCommandTargets(sseClients, command);
-    const connectedClientIdentities = Array.from(sseClients).map((client) => ({
-      clientId: client.id,
-      agentId: client.agentId,
-      agentAliases: client.agentAliases,
-      taskIds: client.taskIds
-    }));
+    const connectedClientIdentities = listConnectedClientIdentities(sseClients);
 
     logInfo("Desktop command routed", {
       ...buildRequestContext(request),
@@ -313,7 +350,6 @@ export function createArkWidgetApp(options = {}) {
       trackedState: trackedCallAssociatedDataState
     });
     const transformedBody = shouldTransformCallLifecyclePayload(endpoint, [
-      ariesNewCallEndpoint,
       ariesRecordTransactionEndpoint
     ])
       ? buildAriesNewCallPayload({
@@ -463,6 +499,7 @@ export function createArkWidgetApp(options = {}) {
   app.use(express.json({ limit: "10mb" }));
   app.use(mountPath, router);
   app.locals.arkWidgetMountPath = mountPath;
+  app.locals.arkWidgetOrphanClientSweep = orphanClientSweep;
   return app;
 }
 
@@ -647,8 +684,8 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   const callProcessingDetails = interaction?.callProcessingDetails ?? {};
   const eventName = normalizeOptionalString(body?.eventName);
   const interactionId = normalizeOptionalString(interaction?.interactionId);
-  const eventTime = eventData?.eventTime ?? null;
-  const isStartEvent = eventName === "eAgentOfferContact";
+  const eventTime = normalizeEpochTimeToIso(eventData?.eventTime);
+  const isStartEvent = eventName === "eAgentContact";
   const isEndEvent = eventName === "eAgentContactEnded";
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
@@ -664,8 +701,9 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
     loginId: normalizeOptionalString(eventData?.agentId),
     loginName: normalizeOptionalString(eventData?.agentEmailId),
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
-    callStartTime: isStartEvent ? eventTime : knownCallStartTime,
-    callEndTime: isEndEvent ? eventTime : null,
+    Hostname: normalizeOptionalString(eventData?.hostName) ?? null,
+    callStartTime: normalizeEpochTimeToIso(isStartEvent ? eventTime : knownCallStartTime),
+    callEndTime: normalizeEpochTimeToIso(isEndEvent ? eventTime : null),
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
     consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
   };
@@ -892,6 +930,37 @@ function normalizeAriesFieldValue(value) {
   return value;
 }
 
+function normalizeEpochTimeToIso(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "number" || (typeof value === "string" && /^\d+$/.test(value.trim()))) {
+    const numericValue = Number(value);
+
+    if (!Number.isFinite(numericValue)) {
+      return null;
+    }
+
+    const epochMilliseconds = numericValue < 1e12 ? numericValue * 1000 : numericValue;
+    const parsedDate = new Date(epochMilliseconds);
+
+    if (Number.isNaN(parsedDate.getTime())) {
+      return null;
+    }
+
+    return parsedDate.toISOString();
+  }
+
+  const parsedDate = new Date(String(value));
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return String(value);
+  }
+
+  return parsedDate.toISOString();
+}
+
 function normalizeMountPath(input) {
   if (!input || input === "/") {
     return "/";
@@ -929,6 +998,73 @@ function findClientById(clients, clientId) {
   return null;
 }
 
+function startOrphanClientSweep({ clients, maxAgeMs, sweepIntervalMs }) {
+  if (!(clients instanceof Set) || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+    return null;
+  }
+
+  if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs <= 0) {
+    return null;
+  }
+
+  const timer = setInterval(() => {
+    const now = Date.now();
+
+    for (const client of clients) {
+      if (hasRegisteredDesktopIdentity(client)) {
+        continue;
+      }
+
+      const connectedAt = Number.isFinite(client?.connectedAt) ? client.connectedAt : now;
+
+      if (now - connectedAt < maxAgeMs) {
+        continue;
+      }
+
+      clients.delete(client);
+      logWarn("Purged orphaned desktop client", {
+        clientId: client?.id ?? null,
+        connectedAt: connectedAt ? new Date(connectedAt).toISOString() : null,
+        ageMs: now - connectedAt,
+        connectedClients: clients.size,
+        reason: "missing-agent-id"
+      });
+
+      try {
+        client?.response?.end?.();
+      } catch {
+        // Ignore response close failures during orphan cleanup.
+      }
+    }
+  }, sweepIntervalMs);
+
+  timer.unref?.();
+  return timer;
+}
+
+function listConnectedClientIdentities(clients) {
+  return Array.from(clients).map((client) => ({
+    clientId: client.id,
+    agentId: client.agentId,
+    agentAliases: client.agentAliases,
+    taskIds: client.taskIds,
+    interactionIds: client.interactionIds
+  }));
+}
+
+function hasRegisteredDesktopIdentity(client) {
+  if (!client || typeof client !== "object") {
+    return false;
+  }
+
+  return Boolean(
+    client.agentId
+    || client.agentAliases?.length
+    || client.taskIds?.length
+    || client.interactionIds?.length
+  );
+}
+
 function normalizeIdentityValue(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -959,10 +1095,12 @@ function getCommandTarget(command) {
   const target = command?.target ?? {};
   const agentId = normalizeIdentityValue(command?.agentId ?? target.agentId);
   const taskId = normalizeIdentityValue(command?.taskId ?? target.taskId);
+  const interactionId = normalizeIdentityValue(command?.interactionId ?? target.interactionId);
 
   return {
     agentId,
-    taskId
+    taskId,
+    interactionId
   };
 }
 
@@ -970,7 +1108,7 @@ function selectCommandTargets(clients, command) {
   const allClients = Array.from(clients);
   const target = getCommandTarget(command);
 
-  if (!target.agentId && !target.taskId) {
+  if (!target.agentId && !target.taskId && !target.interactionId) {
     return allClients;
   }
 
@@ -984,6 +1122,10 @@ function selectCommandTargets(clients, command) {
     }
 
     if (target.taskId && client.taskIds.includes(target.taskId)) {
+      return true;
+    }
+
+    if (target.interactionId && client.interactionIds.includes(target.interactionId)) {
       return true;
     }
 
