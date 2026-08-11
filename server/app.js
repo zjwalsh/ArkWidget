@@ -169,9 +169,10 @@ export function createArkWidgetApp(options = {}) {
   router.get("/desktop.js", (_request, response) => {
     const configPath = joinMountPath(mountPath, "/config.js");
     const entryPath = joinMountPath(mountPath, "/app/main.js");
+    const requestAssetVersion = Date.now().toString();
 
     response.type("application/javascript");
-    response.send(buildDesktopBootstrapScript(configPath, entryPath, widgetAssetVersion));
+    response.send(buildDesktopBootstrapScript(configPath, entryPath, requestAssetVersion));
   });
 
   router.get("/events", (request, response) => {
@@ -333,6 +334,8 @@ export function createArkWidgetApp(options = {}) {
 
   router.post("/api/third-party/forward", async (request, response) => {
     const { endpoint = "/", method = "POST", body, headers = {}, useUploadApi = false } = request.body ?? {};
+    const sourceEventName = normalizeOptionalString(request.body?.body?.eventName);
+    const sourceInteractionId = resolveInteractionId(body);
 
     if (typeof endpoint !== "string" || !endpoint.startsWith("/")) {
       logWarn("Aries forward rejected", {
@@ -359,6 +362,19 @@ export function createArkWidgetApp(options = {}) {
       })
       : trackedForwardContext.forwardBody;
     let finalForwardBody = transformedBody;
+
+    if (endpoint === ariesRecordTransactionEndpoint) {
+      logInfo("Aries call timing computed", {
+        ...buildRequestContext(request),
+        endpoint,
+        method,
+        sourceEventName,
+        sourceInteractionId,
+        callStartTime: transformedBody?.callStartTime ?? null,
+        callStopTime: transformedBody?.callStopTime ?? null,
+        callEndTime: transformedBody?.callEndTime ?? null
+      });
+    }
 
     if (useUploadApi) {
       try {
@@ -391,6 +407,9 @@ export function createArkWidgetApp(options = {}) {
       endpoint,
       method,
       useUploadApi,
+      sourceEventName,
+      sourceInteractionId,
+      lifecyclePayloadTransformed: shouldTransformCallLifecyclePayload(endpoint, [ariesRecordTransactionEndpoint]),
       interactionId: trackedForwardContext.interactionId,
       trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
       extractedTrackedCallAssociatedData: trackedForwardContext.extractedTrackedCallAssociatedData,
@@ -685,15 +704,20 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   const eventName = normalizeOptionalString(body?.eventName);
   const interactionId = normalizeOptionalString(interaction?.interactionId);
   const eventTime = normalizeEpochTimeToIso(eventData?.eventTime);
-  const isStartEvent = eventName === "eAgentContact";
+  const isStartEvent = ["eAgentOfferContact", "eAgentContact"].includes(eventName);
   const isEndEvent = eventName === "eAgentContactEnded";
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
     : null;
 
-  if (interactionId && isStartEvent && eventTime !== null) {
+  if (interactionId && isStartEvent && eventTime !== null && !knownCallStartTime) {
     callLifecycleState?.callStartTimeByInteractionId?.set?.(interactionId, eventTime);
   }
+
+  const callStartTime = normalizeEpochTimeToIso(
+    knownCallStartTime ?? (isStartEvent ? eventTime : null)
+  );
+  const callStopTime = normalizeEpochTimeToIso(isEndEvent ? eventTime : null);
 
   return {
     transactionId: interactionId,
@@ -701,9 +725,10 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
     loginId: normalizeOptionalString(eventData?.agentId),
     loginName: normalizeOptionalString(eventData?.agentEmailId),
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
-    Hostname: normalizeOptionalString(eventData?.hostName) ?? null,
-    callStartTime: normalizeEpochTimeToIso(isStartEvent ? eventTime : knownCallStartTime),
-    callEndTime: normalizeEpochTimeToIso(isEndEvent ? eventTime : null),
+    Hostname: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
+    callStartTime,
+    callStopTime,
+    callEndTime: callStopTime,
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
     consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
   };
@@ -1133,8 +1158,8 @@ function selectCommandTargets(clients, command) {
   });
 }
 
-function buildDesktopBootstrapScript(configPath, entryPath) {
-  var versionQuery = new URLSearchParams({ v: arguments[2] || "" }).toString();
+function buildDesktopBootstrapScript(configPath, entryPath, assetVersion) {
+  var versionQuery = new URLSearchParams({ v: assetVersion || "" }).toString();
   var resolvedConfigPath = versionQuery ? `${configPath}?${versionQuery}` : configPath;
   var resolvedEntryPath = versionQuery ? `${entryPath}?${versionQuery}` : entryPath;
   return `(function bootstrapArkWidget() {

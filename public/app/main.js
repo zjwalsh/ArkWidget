@@ -378,6 +378,12 @@ async function handleCallLifecycleEvent(event) {
     detectedAt: new Date().toISOString()
   };
 
+  console.info("[ark-widget] call lifecycle event", {
+    eventName: event?.eventName ?? null,
+    interactionId: resolveCurrentInteractionId(),
+    detectedAt: payload.detectedAt
+  });
+
   await ariesApi.sendRecordTransactionEvent(payload);
 }
 
@@ -386,7 +392,10 @@ function isCallLifecycleEvent(event) {
     return false;
   }
 
-  if (!["eAgentContact", "eAgentContactEnded"].includes(event.eventName)) {
+  if (![
+    "eAgentOfferContact",
+    "eAgentContactEnded"
+  ].includes(event.eventName)) {
     return false;
   }
 
