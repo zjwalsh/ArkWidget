@@ -371,7 +371,6 @@ export function createArkWidgetApp(options = {}) {
         sourceEventName,
         sourceInteractionId,
         callStartTime: transformedBody?.callStartTime ?? null,
-        callStopTime: transformedBody?.callStopTime ?? null,
         callEndTime: transformedBody?.callEndTime ?? null
       });
     }
@@ -722,12 +721,11 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   return {
     transactionId: interactionId,
     userEmail: normalizeOptionalString(eventData?.agentEmailId),
-    loginId: normalizeOptionalString(eventData?.agentId),
+    loginId: null,
     loginName: normalizeOptionalString(eventData?.agentEmailId),
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
     Hostname: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
     callStartTime,
-    callStopTime,
     callEndTime: callStopTime,
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
     consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
