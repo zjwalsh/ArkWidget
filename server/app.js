@@ -48,6 +48,9 @@ export function createArkWidgetApp(options = {}) {
   const ariesRecordTransactionEndpoint = options.ariesRecordTransactionEndpoint
     ?? process.env.ARIES_RECORD_TRANSACTION_ENDPOINT
     ?? "/recordtransaction";
+  const ariesTimeZone = options.ariesTimeZone
+    ?? process.env.ARIES_TIME_ZONE
+    ?? "America/Chicago";
   const trackedCallAssociatedDataFields = buildTrackedCallAssociatedDataFields({
     consentRecordingFieldName: options.ariesConsentRecordingFieldName
       ?? process.env.ARIES_CONSENT_RECORDING_FIELD_NAME,
@@ -358,7 +361,8 @@ export function createArkWidgetApp(options = {}) {
       ? buildAriesNewCallPayload({
         body: trackedForwardContext.forwardBody,
         trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
-        callLifecycleState
+        callLifecycleState,
+        timeZone: ariesTimeZone
       })
       : trackedForwardContext.forwardBody;
     let finalForwardBody = transformedBody;
@@ -696,13 +700,13 @@ function attachTrackedCallAssociatedData(body, trackedCallAssociatedData) {
   };
 }
 
-function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecycleState }) {
+function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecycleState, timeZone }) {
   const eventData = body?.payload?.data ?? {};
   const interaction = eventData?.interaction ?? {};
   const callProcessingDetails = interaction?.callProcessingDetails ?? {};
   const eventName = normalizeOptionalString(body?.eventName);
   const interactionId = normalizeOptionalString(interaction?.interactionId);
-  const eventTime = normalizeEpochTimeToIso(eventData?.eventTime);
+  const eventTime = normalizeEpochTimeToIso(eventData?.eventTime, timeZone);
   const isStartEvent = ["eAgentOfferContact", "eAgentContact"].includes(eventName);
   const isEndEvent = eventName === "eAgentContactEnded";
   const knownCallStartTime = interactionId
@@ -714,18 +718,19 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   }
 
   const callStartTime = normalizeEpochTimeToIso(
-    knownCallStartTime ?? (isStartEvent ? eventTime : null)
+    knownCallStartTime ?? (isStartEvent ? eventTime : null),
+    timeZone
   );
-  const callStopTime = normalizeEpochTimeToIso(isEndEvent ? eventTime : null);
+  const callStopTime = normalizeEpochTimeToIso(isEndEvent ? eventTime : null, timeZone);
 
   return {
     transactionId: interactionId,
     userEmail: normalizeOptionalString(eventData?.agentEmailId),
-    loginId: null,
+    loginId:  "1234546789", //normalizeOptionalString(eventData?.agentId),
     loginName: normalizeOptionalString(eventData?.agentEmailId),
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
-    Hostname: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
-    callStartTime,
+    hostname: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
+    callStartTime: callStartTime,
     callEndTime: callStopTime,
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
     consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
@@ -932,6 +937,14 @@ function normalizeAriesFieldValue(value) {
     return null;
   }
 
+  if (value === true) {
+    return "Y";
+  }
+
+  if (value === false) {
+    return "N";
+  }
+
   if (typeof value === "string") {
     const trimmedValue = value.trim();
 
@@ -940,11 +953,11 @@ function normalizeAriesFieldValue(value) {
     }
 
     if (trimmedValue.toLowerCase() === "true") {
-      return true;
+      return "Y";
     }
 
     if (trimmedValue.toLowerCase() === "false") {
-      return false;
+      return "N";
     }
 
     return trimmedValue;
@@ -953,7 +966,7 @@ function normalizeAriesFieldValue(value) {
   return value;
 }
 
-function normalizeEpochTimeToIso(value) {
+function normalizeEpochTimeToIso(value, timeZone = "UTC") {
   if (value === undefined || value === null || value === "") {
     return null;
   }
@@ -972,7 +985,7 @@ function normalizeEpochTimeToIso(value) {
       return null;
     }
 
-    return parsedDate.toISOString();
+    return formatIsoTimeInZone(parsedDate, timeZone);
   }
 
   const parsedDate = new Date(String(value));
@@ -981,7 +994,40 @@ function normalizeEpochTimeToIso(value) {
     return String(value);
   }
 
-  return parsedDate.toISOString();
+  return formatIsoTimeInZone(parsedDate, timeZone);
+}
+
+function formatIsoTimeInZone(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date).reduce((result, part) => {
+    result[part.type] = part.value;
+    return result;
+  }, {});
+  const localTime = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(date.getUTCMilliseconds()).padStart(3, "0")}`;
+  const localTimestamp = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second),
+    date.getUTCMilliseconds()
+  );
+  const offsetMinutes = Math.round((localTimestamp - date.getTime()) / 60000);
+  const offsetSign = offsetMinutes < 0 ? "-" : "+";
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffsetMinutes / 60)).padStart(2, "0");
+  const remainingOffsetMinutes = String(absoluteOffsetMinutes % 60).padStart(2, "0");
+
+  return `${localTime}${offsetSign}${offsetHours}:${remainingOffsetMinutes}`;
 }
 
 function normalizeMountPath(input) {

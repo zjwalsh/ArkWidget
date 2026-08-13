@@ -220,6 +220,7 @@ ARIES_API_BASE_URL=https://api.example.com
 ARIES_API_UPLOAD_URL=https://api.example.com
 ARIES_API_KEY=replace-me
 ARIES_API_TIMEOUT_MS=10000
+ARIES_TIME_ZONE=America/Chicago
 ARIES_NEW_CALL_ENDPOINT=/contact-arrivals
 ARIES_RECORD_TRANSACTION_ENDPOINT=/recordtransaction
 ARIES_CONSENT_RECORDING_FIELD_NAME=JW_Aries_consentRecComp
