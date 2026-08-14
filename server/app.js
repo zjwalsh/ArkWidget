@@ -934,7 +934,7 @@ function validateCommandBasicAuth({ request, expectedUsername, expectedPassword 
 
 function normalizeAriesFieldValue(value) {
   if (value === undefined || value === null || value === "") {
-    return null;
+    return "N";
   }
 
   if (value === true) {
@@ -948,7 +948,7 @@ function normalizeAriesFieldValue(value) {
   if (typeof value === "string") {
     const trimmedValue = value.trim();
 
-    if (trimmedValue === "") {
+    if (trimmedValue === "" || trimmedValue === null) {
       return "N";
     }
 
