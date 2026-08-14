@@ -1019,7 +1019,7 @@ function formatIsoTimeInZone(date, timeZone) {
   const offsetHours = String(Math.floor(absoluteOffsetMinutes / 60)).padStart(2, "0");
   const remainingOffsetMinutes = String(absoluteOffsetMinutes % 60).padStart(2, "0");
 
-  return `${localTime}${offsetSign}${offsetHours}:${remainingOffsetMinutes}`;
+  return `${localTime}Z`;
 }
 
 function normalizeMountPath(input) {
