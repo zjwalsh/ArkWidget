@@ -729,7 +729,7 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
     loginId:  "1234546789", //normalizeOptionalString(eventData?.agentId),
     loginName: normalizeOptionalString(eventData?.agentEmailId),
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
-    hostname: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
+    hostName: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
     callStartTime: callStartTime,
     callEndTime: callStopTime,
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
@@ -949,14 +949,6 @@ function normalizeAriesFieldValue(value) {
     const trimmedValue = value.trim();
 
     if (trimmedValue === "") {
-      return null;
-    }
-
-    if (trimmedValue.toLowerCase() === "true") {
-      return "Y";
-    }
-
-    if (trimmedValue.toLowerCase() === "false") {
       return "N";
     }
 
