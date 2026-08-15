@@ -394,7 +394,13 @@ function isCallLifecycleEvent(event) {
 
   if (![
     "eAgentOfferContact",
-    "eAgentContactEnded"
+    "eAgentContact",
+    "eAgentContactEnded",
+    "eAgentWrapup",
+    "eAgentContactWrappedUp",
+    "eAgentConsultTransferring",
+    "eContactOwnerChanged",
+    "eAgentblindTransferred"
   ].includes(event.eventName)) {
     return false;
   }

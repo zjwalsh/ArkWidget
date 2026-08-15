@@ -708,7 +708,14 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   const interactionId = normalizeOptionalString(interaction?.interactionId);
   const eventTime = normalizeEpochTimeToIso(eventData?.eventTime, timeZone);
   const isStartEvent = ["eAgentOfferContact", "eAgentContact"].includes(eventName);
-  const isEndEvent = eventName === "eAgentContactEnded";
+  const isEndEvent = [
+    "eAgentContactEnded",
+    "eAgentWrapup",
+    "eAgentContactWrappedUp",
+    "eAgentConsultTransferring",
+    "eContactOwnerChanged",
+    "eAgentblindTransferred"
+  ].includes(eventName);
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
     : null;

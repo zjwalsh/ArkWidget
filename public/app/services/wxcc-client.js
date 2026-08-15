@@ -1,5 +1,16 @@
 import { MediaCaptureService } from "./media-capture.js";
 
+const CONTACT_EVENT_NAMES = [
+  "eAgentOfferContact",
+  "eAgentContact",
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged",
+  "eAgentblindTransferred"
+];
+
 export class WxccClient {
   constructor(config) {
     this.config = config;
@@ -60,22 +71,22 @@ export class WxccClient {
       listener({ source: "sdk", type: "dialer-event", eventName: "eOutdialFailed", payload: message });
     };
 
-    const offerContactListener = createContactListener(listener, "eAgentOfferContact");
-    const activeContactListener = createContactListener(listener, "eAgentContact");
-    const contactEndedListener = createContactListener(listener, "eAgentContactEnded");
+    const contactListeners = new Map(
+      CONTACT_EVENT_NAMES.map((eventName) => [eventName, createContactListener(listener, eventName)])
+    );
 
     this.desktop.agentStateInfo.addEventListener("updated", stateListener);
     this.desktop.dialer?.addEventListener?.("eOutdialFailed", outdialFailedListener);
-    this.desktop.agentContact.addEventListener("eAgentContact", activeContactListener);
-    this.desktop.agentContact.addEventListener("eAgentOfferContact", offerContactListener);
-    this.desktop.agentContact.addEventListener("eAgentContactEnded", contactEndedListener);
+    contactListeners.forEach((contactListener, eventName) => {
+      this.desktop.agentContact.addEventListener(eventName, contactListener);
+    });
 
     return () => {
       this.desktop.agentStateInfo.removeEventListener("updated", stateListener);
       this.desktop.dialer?.removeEventListener?.("eOutdialFailed", outdialFailedListener);
-      this.desktop.agentContact.removeEventListener("eAgentContact", activeContactListener);
-      this.desktop.agentContact.removeEventListener("eAgentOfferContact", offerContactListener);
-      this.desktop.agentContact.removeEventListener("eAgentContactEnded", contactEndedListener);
+      contactListeners.forEach((contactListener, eventName) => {
+        this.desktop.agentContact.removeEventListener(eventName, contactListener);
+      });
     };
   }
 
