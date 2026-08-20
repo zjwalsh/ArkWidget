@@ -146,7 +146,7 @@ export class MediaCaptureService {
       durationMs,
       startedAt: new Date(startedAt).toISOString(),
       stoppedAt: new Date().toISOString(),
-      metadata: options.metadata ?? startedOptions.metadata ?? null,
+      metadata: mergeCaptureMetadata(startedOptions.metadata, options.metadata),
       audioBase64
     };
 
@@ -188,7 +188,7 @@ export class MediaCaptureService {
 
     const captureToConfirm = this.pendingCapture;
     this.pendingCapture = null;
-    const metadata = options.metadata ?? captureToConfirm.metadata ?? null;
+    const metadata = mergeCaptureMetadata(captureToConfirm.metadata, options.metadata);
 
     return {
       ...captureToConfirm,
@@ -225,6 +225,24 @@ export class MediaCaptureService {
       metadata: this.activeSession.options.metadata ?? null
     };
   }
+}
+
+function mergeCaptureMetadata(baseMetadata, overrideMetadata) {
+  const normalizedBaseMetadata = isPlainObject(baseMetadata) ? baseMetadata : null;
+  const normalizedOverrideMetadata = isPlainObject(overrideMetadata) ? overrideMetadata : null;
+
+  if (!normalizedBaseMetadata && !normalizedOverrideMetadata) {
+    return overrideMetadata ?? baseMetadata ?? null;
+  }
+
+  return {
+    ...(normalizedBaseMetadata ?? {}),
+    ...(normalizedOverrideMetadata ?? {})
+  };
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function startSignalMonitor(stream) {

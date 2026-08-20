@@ -83,7 +83,7 @@ export class AriesApiClient {
 
   async forward(payload) {
     const body = safeJsonStringify(payload);
-    const response = await fetch(this.forwardPath, {
+    const response = await fetchWithRetry(this.forwardPath, {
       method: "POST",
       headers: {
         "content-type": "application/json"
@@ -100,6 +100,36 @@ export class AriesApiClient {
 
     return data ?? text;
   }
+}
+
+async function fetchWithRetry(url, options, attempts = 2) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+
+      if (response.status < 500 || attempt === attempts) {
+        return response;
+      }
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === attempts) {
+        throw error;
+      }
+    }
+
+    await delay(750);
+  }
+
+  throw lastError ?? new Error("Request failed.");
+}
+
+function delay(durationMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
 }
 
 function firstNonEmptyValue(...values) {

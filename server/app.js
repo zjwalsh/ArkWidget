@@ -1,4 +1,5 @@
 import express from "express";
+import ffmpegStatic from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -142,7 +143,7 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.get("/config.js", (request, response) => {
-    const runtimeOrigin = publicOrigin || getRequestOrigin(request);
+    const runtimeOrigin = publicOrigin || "";
     const config = {
       widgetName: options.widgetName ?? process.env.WIDGET_NAME ?? "ark-widget",
       widgetProvider: options.widgetProvider ?? process.env.WIDGET_PROVIDER ?? "ArkWidget",
@@ -165,6 +166,7 @@ export function createArkWidgetApp(options = {}) {
       ...buildRequestContext(request),
       mountPath,
       publicOrigin: publicOrigin || undefined,
+      runtimeOrigin: runtimeOrigin || undefined,
       requireAgentDesktop
     });
   });
@@ -419,6 +421,28 @@ export function createArkWidgetApp(options = {}) {
       body: sanitizeForwardBodyForLog(forwardRequest.body)
     });
 
+    if (endpoint === "/command-results") {
+      const savedCommandResult = await maybePersistCommandResult({
+        body: forwardRequest,
+        commandResultsDir,
+        requestId: request.requestId
+      });
+
+      logInfo("Command result kept local", {
+        ...buildRequestContext(request),
+        endpoint,
+        savedCommandResultPath: savedCommandResult?.filePath ?? null,
+        commandType: savedCommandResult?.commandType ?? null
+      });
+
+      response.status(202).json({
+        accepted: true,
+        forwardedToAries: false,
+        savedCommandResult
+      });
+      return;
+    }
+
     const destinationBaseUrl = useUploadApi && ariesUploadUrl
       ? ariesUploadUrl
       : ariesBaseUrl;
@@ -456,7 +480,9 @@ export function createArkWidgetApp(options = {}) {
       return;
     }
 
-    const url = resolveAriesUrl(destinationBaseUrl, endpoint);
+    const url = useUploadApi
+      ? new URL(destinationBaseUrl)
+      : resolveAriesUrl(destinationBaseUrl, endpoint);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ariesTimeoutMs);
     const startedAt = Date.now();
@@ -564,27 +590,51 @@ function buildTrackedCallAssociatedDataFields({ consentRecordingFieldName, conse
   return [
     {
       outputKey: "consentRecordingComplete",
-      fieldName: normalizeOptionalString(consentRecordingFieldName)
+      fieldNames: buildTrackedFieldNameCandidates(
+        consentRecordingFieldName,
+        ["consentRecordingComplete", "consentRecComp"]
+      )
     },
     {
       outputKey: "consentScriptPlayed",
-      fieldName: normalizeOptionalString(consentScriptPlayedFieldName)
+      fieldNames: buildTrackedFieldNameCandidates(
+        consentScriptPlayedFieldName,
+        ["consentScriptPlayed", "consentScrPlayedSw"]
+      )
     }
-  ].filter((definition) => Boolean(definition.fieldName));
+  ].filter((definition) => definition.fieldNames.length > 0);
+}
+
+function buildTrackedFieldNameCandidates(configuredFieldName, fallbackFieldNames = []) {
+  const configuredName = normalizeOptionalString(configuredFieldName);
+
+  return Array.from(new Set([
+    configuredName,
+    ...fallbackFieldNames.map((fieldName) => normalizeOptionalString(fieldName))
+  ].filter(Boolean)));
 }
 
 export function resolveTrackedCallAssociatedDataContext({ body, trackedFieldDefinitions, trackedState }) {
+  const directTrackedCallAssociatedData = normalizeDirectTrackedCallAssociatedData(
+    body?.trackedCallAssociatedData
+    ?? body?.payload?.trackedCallAssociatedData
+    ?? body?.payload?.data?.trackedCallAssociatedData
+  );
+
   if (!Array.isArray(trackedFieldDefinitions) || trackedFieldDefinitions.length === 0) {
     return {
       interactionId: resolveInteractionId(body),
-      extractedTrackedCallAssociatedData: null,
-      trackedCallAssociatedData: null,
+      extractedTrackedCallAssociatedData: directTrackedCallAssociatedData,
+      trackedCallAssociatedData: directTrackedCallAssociatedData,
       forwardBody: body
     };
   }
 
   const interactionId = resolveInteractionId(body);
-  const extractedTrackedCallAssociatedData = extractTrackedCallAssociatedData(body, trackedFieldDefinitions);
+  const extractedTrackedCallAssociatedData = mergeTrackedCallAssociatedData(
+    extractTrackedCallAssociatedData(body, trackedFieldDefinitions),
+    directTrackedCallAssociatedData
+  );
   const trackedByInteraction = interactionId
     ? trackedState?.byInteractionId?.get?.(interactionId) ?? null
     : null;
@@ -620,15 +670,39 @@ export function resolveTrackedCallAssociatedDataContext({ body, trackedFieldDefi
   };
 }
 
-function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
-  const callAssociatedData = findFirstNestedObjectByNormalizedKey(body, "callassociateddata");
-
-  if (!callAssociatedData) {
+function normalizeDirectTrackedCallAssociatedData(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
 
+  const normalizedTrackedCallAssociatedData = {};
+
+  if (value.consentRecordingComplete !== undefined) {
+    normalizedTrackedCallAssociatedData.consentRecordingComplete = normalizeTrackedFieldValue(
+      value.consentRecordingComplete
+    );
+  }
+
+  if (value.consentScriptPlayed !== undefined) {
+    normalizedTrackedCallAssociatedData.consentScriptPlayed = normalizeTrackedFieldValue(
+      value.consentScriptPlayed
+    );
+  }
+
+  return hasTrackedCallAssociatedData(normalizedTrackedCallAssociatedData)
+    ? normalizedTrackedCallAssociatedData
+    : null;
+}
+
+function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
+  const trackedSources = findTrackedFieldSources(body);
+
   const extracted = trackedFieldDefinitions.reduce((result, definition) => {
-    const fieldValue = readCallAssociatedDataValue(callAssociatedData, definition.fieldName);
+    const fieldValue = readTrackedFieldValue({
+      body,
+      trackedSources,
+      fieldNames: definition.fieldNames
+    });
 
     if (fieldValue !== null) {
       result[definition.outputKey] = fieldValue;
@@ -640,12 +714,73 @@ function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
   return Object.keys(extracted).length > 0 ? extracted : null;
 }
 
+function findTrackedFieldSources(body) {
+  const preferredSources = [
+    body?.payload?.data?.interaction?.callAssociatedData,
+    body?.payload?.data?.interaction?.callassociateddata,
+    body?.payload?.interaction?.callAssociatedData,
+    body?.payload?.interaction?.callassociateddata,
+    body?.payload?.data?.callAssociatedData,
+    body?.payload?.data?.callassociateddata,
+    body?.payload?.callAssociatedData,
+    body?.payload?.callassociateddata
+  ].filter((value) => value && typeof value === "object");
+
+  return dedupeObjectReferences([
+    ...preferredSources,
+    ...findNestedObjectsByNormalizedKey(body, "callassociateddata"),
+    ...findNestedObjectsByNormalizedKey(body, "calldetail"),
+    ...findNestedObjectsByNormalizedKey(body, "calldetails")
+  ]);
+}
+
+function dedupeObjectReferences(values) {
+  const seen = new Set();
+
+  return values.filter((value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    if (seen.has(value)) {
+      return false;
+    }
+
+    seen.add(value);
+    return true;
+  });
+}
+
+function readTrackedFieldValue({ body, trackedSources, fieldNames }) {
+  if (!Array.isArray(fieldNames) || fieldNames.length === 0) {
+    return null;
+  }
+
+  for (const fieldName of fieldNames) {
+    for (const trackedSource of trackedSources) {
+      const value = readCallAssociatedDataValue(trackedSource, fieldName);
+
+      if (value !== null) {
+        return value;
+      }
+    }
+
+    const [nestedValue] = findNestedValuesByNormalizedKey(body, normalizeKeyName(fieldName));
+
+    if (nestedValue !== undefined) {
+      return nestedValue;
+    }
+  }
+
+  return null;
+}
+
 function readCallAssociatedDataValue(callAssociatedData, fieldName) {
   if (!fieldName || !callAssociatedData || typeof callAssociatedData !== "object") {
     return null;
   }
 
-  const value = callAssociatedData[fieldName];
+  const value = resolveCallAssociatedDataFieldValue(callAssociatedData, fieldName);
 
   if (value === undefined || value === null) {
     return null;
@@ -656,6 +791,24 @@ function readCallAssociatedDataValue(callAssociatedData, fieldName) {
   }
 
   return normalizeTrackedFieldValue(value);
+}
+
+function resolveCallAssociatedDataFieldValue(callAssociatedData, fieldName) {
+  if (fieldName in callAssociatedData) {
+    return callAssociatedData[fieldName];
+  }
+
+  const normalizedFieldName = normalizeKeyName(fieldName);
+  const directEntry = Object.entries(callAssociatedData).find(
+    ([key]) => normalizeKeyName(key) === normalizedFieldName
+  );
+
+  if (directEntry) {
+    return directEntry[1];
+  }
+
+  const [nestedValue] = findNestedValuesByNormalizedKey(callAssociatedData, normalizedFieldName);
+  return nestedValue ?? null;
 }
 
 function normalizeTrackedFieldValue(value) {
@@ -705,17 +858,10 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   const interaction = eventData?.interaction ?? {};
   const callProcessingDetails = interaction?.callProcessingDetails ?? {};
   const eventName = normalizeOptionalString(body?.eventName);
-  const interactionId = normalizeOptionalString(interaction?.interactionId);
+  const interactionId = resolveInteractionId(body);
   const eventTime = normalizeEpochTimeToIso(eventData?.eventTime, timeZone);
   const isStartEvent = ["eAgentOfferContact", "eAgentContact"].includes(eventName);
-  const isEndEvent = [
-    "eAgentContactEnded",
-    "eAgentWrapup",
-    "eAgentContactWrappedUp",
-    "eAgentConsultTransferring",
-    "eContactOwnerChanged",
-    "eAgentblindTransferred"
-  ].includes(eventName);
+  const isEndEvent = eventName === "eAgentContactEnded";
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
     : null;
@@ -729,12 +875,18 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
     timeZone
   );
   const callStopTime = normalizeEpochTimeToIso(isEndEvent ? eventTime : null, timeZone);
+  const userEmail = pickFirstString([
+    eventData?.agentEmailId,
+    body?.payload?.agentEmailId,
+    ...findNestedValuesByNormalizedKey(body, "agentemailid"),
+    ...findNestedValuesByNormalizedKey(body, "email")
+  ]);
 
   return {
     transactionId: interactionId,
-    userEmail: normalizeOptionalString(eventData?.agentEmailId),
+    userEmail,
     loginId:  "1234546789", //normalizeOptionalString(eventData?.agentId),
-    loginName: normalizeOptionalString(eventData?.agentEmailId),
+    loginName: userEmail,
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
     hostName: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
     callStartTime: callStartTime,
@@ -850,6 +1002,39 @@ function findFirstNestedObjectByNormalizedKey(input, normalizedKey) {
     }
 
     return null;
+  }
+}
+
+function findNestedObjectsByNormalizedKey(input, normalizedKey) {
+  const matches = [];
+  const seen = new WeakSet();
+
+  walk(input, 0);
+  return matches;
+
+  function walk(value, depth) {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (seen.has(value) || depth > 8) {
+      return;
+    }
+
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item, depth + 1));
+      return;
+    }
+
+    Object.entries(value).forEach(([key, currentValue]) => {
+      if (normalizeKeyName(key) === normalizedKey && currentValue && typeof currentValue === "object") {
+        matches.push(currentValue);
+      }
+
+      walk(currentValue, depth + 1);
+    });
   }
 }
 
@@ -1605,7 +1790,14 @@ async function transcodeUploadPayloadToWav(body) {
 
 async function transcodeAudioBufferToWav(inputBuffer) {
   return await new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", [
+    const ffmpegBinary = resolveFfmpegBinary();
+
+    if (!ffmpegBinary) {
+      reject(new Error("ffmpeg binary is not configured or available."));
+      return;
+    }
+
+    const ffmpeg = spawn(ffmpegBinary, [
       "-hide_banner",
       "-loglevel",
       "error",
@@ -1646,6 +1838,20 @@ async function transcodeAudioBufferToWav(inputBuffer) {
     ffmpeg.stdin.on("error", () => {});
     ffmpeg.stdin.end(inputBuffer);
   });
+}
+
+function resolveFfmpegBinary() {
+  const configuredPath = normalizeOptionalString(process.env.FFMPEG_PATH);
+
+  if (configuredPath) {
+    return configuredPath;
+  }
+
+  if (typeof ffmpegStatic === "string" && ffmpegStatic.trim()) {
+    return ffmpegStatic;
+  }
+
+  return "ffmpeg";
 }
 
 function isWavBuffer(buffer) {

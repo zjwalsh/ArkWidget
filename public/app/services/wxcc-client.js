@@ -3,12 +3,7 @@ import { MediaCaptureService } from "./media-capture.js";
 const CONTACT_EVENT_NAMES = [
   "eAgentOfferContact",
   "eAgentContact",
-  "eAgentContactEnded",
-  "eAgentWrapup",
-  "eAgentContactWrappedUp",
-  "eAgentConsultTransferring",
-  "eContactOwnerChanged",
-  "eAgentblindTransferred"
+  "eAgentContactEnded"
 ];
 
 export class WxccClient {

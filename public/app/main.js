@@ -22,6 +22,7 @@ const desktopRoutingState = {
   registrationKey: null,
   skippedIdentityKey: null,
   lastKnownIdentity: null,
+  registrationRetryTimerId: null,
   wxccReady: false,
   monitoringActive: false,
   commandStreamConnected: false,
@@ -83,6 +84,7 @@ async function bootstrap() {
         desktopRoutingState.skippedIdentityKey = null;
         desktopRoutingState.registrationState = "pending";
         desktopRoutingState.registrationError = null;
+        clearDesktopRegistrationRetry();
       }
 
       desktopRoutingState.connectedClientId = nextClientId;
@@ -116,6 +118,7 @@ async function bootstrap() {
         desktopRoutingState.connectedClientId = null;
         desktopRoutingState.registrationKey = null;
         desktopRoutingState.skippedIdentityKey = null;
+        clearDesktopRegistrationRetry();
       }
 
       refreshConnectionStatus(message);
@@ -136,6 +139,9 @@ async function bootstrap() {
           && resolvedCommand?.payload?.delivery
         ) {
           const deliveryResponse = await ariesApi.sendCapturedAudio(resolvedCommand, result);
+          await ariesApi.sendRecordTransactionEvent(
+            buildRecordingSendCompleteEvent(resolvedCommand, result, deliveryResponse)
+          );
           showCommand({
             command: resolvedCommand,
             result: {
@@ -278,6 +284,7 @@ function handleDesktopRoutingError(error) {
     desktopRoutingState.commandStreamConnected = false;
     desktopRoutingState.registrationState = "pending";
     desktopRoutingState.registrationError = null;
+    clearDesktopRegistrationRetry();
     refreshConnectionStatus();
     commandStream.reconnectNow();
     return;
@@ -288,6 +295,40 @@ function handleDesktopRoutingError(error) {
   desktopRoutingState.registrationError = errorMessage;
   refreshConnectionStatus();
   showCommand({ registrationError: errorMessage });
+  scheduleDesktopRegistrationRetry();
+}
+
+function scheduleDesktopRegistrationRetry() {
+  if (
+    desktopRoutingState.registrationRetryTimerId !== null
+    || !desktopRoutingState.commandStreamConnected
+    || !desktopRoutingState.connectedClientId
+  ) {
+    return;
+  }
+
+  desktopRoutingState.registrationRetryTimerId = window.setTimeout(async () => {
+    desktopRoutingState.registrationRetryTimerId = null;
+
+    if (!runtimeViewState.latestEvent || !desktopRoutingState.connectedClientId) {
+      return;
+    }
+
+    try {
+      await syncDesktopRouting(runtimeViewState.latestEvent);
+    } catch (error) {
+      handleDesktopRoutingError(error);
+    }
+  }, 1000);
+}
+
+function clearDesktopRegistrationRetry() {
+  if (desktopRoutingState.registrationRetryTimerId === null) {
+    return;
+  }
+
+  window.clearTimeout(desktopRoutingState.registrationRetryTimerId);
+  desktopRoutingState.registrationRetryTimerId = null;
 }
 
 function showDesktopEvent(event) {
@@ -369,14 +410,12 @@ async function registerDesktopIdentity(identity) {
   desktopRoutingState.skippedIdentityKey = null;
   desktopRoutingState.registrationState = "registered";
   desktopRoutingState.registrationError = null;
+  clearDesktopRegistrationRetry();
   refreshConnectionStatus();
 }
 
 async function handleCallLifecycleEvent(event) {
-  const payload = {
-    ...event,
-    detectedAt: new Date().toISOString()
-  };
+  const payload = buildLifecycleEventPayload(event);
 
   console.info("[ark-widget] call lifecycle event", {
     eventName: event?.eventName ?? null,
@@ -387,6 +426,74 @@ async function handleCallLifecycleEvent(event) {
   await ariesApi.sendRecordTransactionEvent(payload);
 }
 
+function buildLifecycleEventPayload(event) {
+  const storeState = safelyGetStoreState();
+  const eventPayload = isPlainObject(event?.payload) ? event.payload : {};
+  const eventData = isPlainObject(eventPayload.data) ? eventPayload.data : {};
+  const interactionData = isPlainObject(eventData.interaction)
+    ? eventData.interaction
+    : isPlainObject(eventPayload.interaction)
+      ? eventPayload.interaction
+      : {};
+  const interactionId = pickFirstString([
+    eventData?.interactionId,
+    interactionData?.interactionId,
+    resolveCurrentInteractionId()
+  ]);
+  const agentEmailId = resolveCurrentAgentEmail([
+    eventPayload,
+    storeState,
+    wxccClient.getAgentSnapshot()
+  ]);
+
+  return {
+    ...event,
+    detectedAt: new Date().toISOString(),
+    payload: {
+      ...eventPayload,
+      interactionId: eventPayload.interactionId ?? interactionId,
+      interaction: {
+        ...(isPlainObject(eventPayload.interaction) ? eventPayload.interaction : {}),
+        interactionId: eventPayload?.interaction?.interactionId ?? interactionId
+      },
+      data: {
+        ...eventData,
+        interactionId: eventData.interactionId ?? interactionId,
+        interaction: {
+          ...interactionData,
+          interactionId: interactionData.interactionId ?? interactionId
+        },
+        agentEmailId: eventData.agentEmailId ?? agentEmailId,
+        hostName: eventData.hostName ?? eventPayload.hostName ?? "Webex.com"
+      },
+      storeState
+    }
+  };
+}
+
+function resolveCurrentAgentEmail(sources) {
+  return pickFirstString(
+    sources.flatMap((source) => {
+      if (!source || typeof source !== "object") {
+        return [];
+      }
+
+      return [
+        source?.agentSession?.agentEmailId,
+        source?.agentSession?.agentInfo?.email,
+        source?.agentSession?.agentInfo?.agentEmailId,
+        source?.agentProfile?.email,
+        source?.agentProfile?.agentEmailId,
+        source?.agentState?.agentEmailId,
+        source?.agentState?.latestData?.agentEmailId,
+        source?.data?.agentEmailId,
+        ...findNestedValuesByKey(source, "agentemailid"),
+        ...findNestedValuesByKey(source, "email")
+      ];
+    })
+  );
+}
+
 function isCallLifecycleEvent(event) {
   if (event?.source !== "sdk" || event?.type !== "agent-contact") {
     return false;
@@ -395,12 +502,7 @@ function isCallLifecycleEvent(event) {
   if (![
     "eAgentOfferContact",
     "eAgentContact",
-    "eAgentContactEnded",
-    "eAgentWrapup",
-    "eAgentContactWrappedUp",
-    "eAgentConsultTransferring",
-    "eContactOwnerChanged",
-    "eAgentblindTransferred"
+    "eAgentContactEnded"
   ].includes(event.eventName)) {
     return false;
   }
@@ -418,8 +520,129 @@ function isCallLifecycleEvent(event) {
     return true;
   }
 
-  return ["telephony", "call"].includes(String(mediaType).toLowerCase());
+  const normalizedMediaType = String(mediaType).toLowerCase();
+
+  return normalizedMediaType.includes("telephony")
+    || normalizedMediaType.includes("call")
+    || normalizedMediaType.includes("voice");
 }
+
+function buildRecordingSendCompleteEvent(command, captureResult, deliveryResponse) {
+  const latestPayload = runtimeViewState.latestEvent?.source === "sdk"
+    && runtimeViewState.latestEvent?.type === "agent-contact"
+    ? runtimeViewState.latestEvent.payload
+    : null;
+  const trackedCallAssociatedData = resolveTrackedCallAssociatedData(command, captureResult, deliveryResponse);
+  const interactionId = pickFirstString([
+    command?.payload?.interactionId,
+    command?.payload?.metadata?.interactionId,
+    captureResult?.metadata?.interactionId,
+    resolveCurrentInteractionId()
+  ]);
+
+  return {
+    source: "command",
+    type: "recording-send-complete",
+    eventName: "recordingSendComplete",
+    detectedAt: new Date().toISOString(),
+    payload: {
+      ...latestPayload,
+      data: {
+        ...(latestPayload?.data ?? {}),
+        eventTime: Date.now(),
+        interactionId: interactionId ?? latestPayload?.data?.interactionId ?? null,
+        interaction: {
+          ...(latestPayload?.data?.interaction ?? latestPayload?.interaction ?? {}),
+          interactionId: interactionId
+            ?? latestPayload?.data?.interaction?.interactionId
+            ?? latestPayload?.interaction?.interactionId
+            ?? null
+        },
+        agentEmailId: latestPayload?.data?.agentEmailId
+          ?? latestPayload?.agentEmailId
+          ?? null,
+        hostName: latestPayload?.data?.hostName
+          ?? latestPayload?.hostName
+          ?? "Webex.com"
+      },
+      metadata: {
+        ...(isPlainObject(latestPayload?.metadata) ? latestPayload.metadata : {}),
+        ...(isPlainObject(captureResult?.metadata) ? captureResult.metadata : {}),
+        deliveryResponse
+      },
+      ...(trackedCallAssociatedData ? { trackedCallAssociatedData } : {})
+    }
+  };
+}
+
+function resolveTrackedCallAssociatedData(command, captureResult, deliveryResponse) {
+  const metadataSources = [
+    command?.payload?.metadata,
+    captureResult?.metadata
+  ].filter(isPlainObject);
+
+  const directTrackedCallAssociatedData = metadataSources
+    .map((metadata) => metadata.trackedCallAssociatedData)
+    .find(isPlainObject);
+
+  if (directTrackedCallAssociatedData) {
+    return {
+      ...directTrackedCallAssociatedData
+    };
+  }
+
+  const consentRecordingComplete = pickFirstDefinedValue(
+    ...metadataSources.map((metadata) => metadata.consentRecordingComplete),
+    ...metadataSources.map((metadata) => metadata.signatureAccepted),
+    deliveryResponse !== undefined ? true : undefined
+  );
+  const consentScriptPlayed = pickFirstDefinedValue(
+    ...metadataSources.map((metadata) => metadata.consentScriptPlayed),
+    ...metadataSources.map((metadata) => metadata.signatureAccepted)
+  );
+
+  const trackedCallAssociatedData = {};
+
+  if (consentRecordingComplete !== undefined) {
+    trackedCallAssociatedData.consentRecordingComplete = consentRecordingComplete;
+  }
+
+  if (consentScriptPlayed !== undefined) {
+    trackedCallAssociatedData.consentScriptPlayed = consentScriptPlayed;
+  }
+
+  return Object.keys(trackedCallAssociatedData).length > 0
+    ? trackedCallAssociatedData
+    : null;
+}
+
+function pickFirstDefinedValue(...values) {
+  for (const value of values) {
+    if (value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveInteractionIdFromEvent(event) {
+  return resolveInteractionIdFromPayload(event?.payload);
+}
+
+function resolveInteractionIdFromPayload(payload) {
+  return pickFirstString([
+    payload?.interactionId,
+    payload?.data?.interactionId,
+    payload?.interaction?.interactionId,
+    payload?.data?.interaction?.interactionId,
+    payload?.agentContact?.interactionId,
+    payload?.agentContact?.data?.interactionId,
+    payload?.agentContact?.contactData?.interactionId,
+    ...collectInteractionIds(payload ?? {})
+  ]);
+}
+
 
 function extractDesktopIdentity(event) {
   const payload = event?.payload ?? {};
