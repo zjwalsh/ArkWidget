@@ -43,14 +43,19 @@ if (!widget) {
 syncWidget(widget);
 
 bootstrap().catch((error) => {
+  void reportClientDiagnostic("ERROR", "bootstrap-failed", error.message, {
+    stack: error?.stack ?? null
+  });
   updateStatus("Initialization failed");
   showDesktopEvent({ error: error.message });
   console.error(error);
 });
 
 async function bootstrap() {
+  void reportClientDiagnostic("INFO", "bootstrap-start", "Bootstrap started");
   updateStatus("Initializing WXCC SDK");
   await wxccClient.init();
+  void reportClientDiagnostic("INFO", "wxcc-init-complete", "WXCC SDK initialized");
   desktopRoutingState.wxccReady = true;
   refreshConnectionStatus();
 
@@ -77,6 +82,9 @@ async function bootstrap() {
 
   commandStream.connect({
     onReady: async (payload) => {
+      void reportClientDiagnostic("INFO", "command-stream-ready", "Command stream ready", {
+        clientId: payload?.clientId ?? null
+      });
       const nextClientId = payload?.clientId ?? null;
 
       if (desktopRoutingState.connectedClientId !== nextClientId) {
@@ -109,6 +117,11 @@ async function bootstrap() {
       }
     },
     onStatus: (message) => {
+      void reportClientDiagnostic(
+        message === "Command stream connection issue" ? "WARN" : "INFO",
+        "command-stream-status",
+        message
+      );
       if (message === "Command stream connected") {
         desktopRoutingState.commandStreamConnected = true;
       }
@@ -242,6 +255,29 @@ function updateStatus(message) {
   getWidget()?.updateStatus(message);
 }
 
+async function reportClientDiagnostic(level, phase, message, details = {}) {
+  if (!config.clientLogPath) {
+    return;
+  }
+
+  try {
+    await fetch(config.clientLogPath, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        level,
+        phase,
+        message,
+        details
+      })
+    });
+  } catch {
+    // Ignore client diagnostic transport failures.
+  }
+}
+
 function refreshConnectionStatus(fallbackMessage = null) {
   if (!desktopRoutingState.wxccReady) {
     updateStatus(fallbackMessage ?? "Initializing WXCC SDK");
@@ -277,6 +313,7 @@ function refreshConnectionStatus(fallbackMessage = null) {
 }
 
 function handleDesktopRoutingError(error) {
+  void reportClientDiagnostic("ERROR", "desktop-routing-error", error instanceof Error ? error.message : String(error));
   if (error?.status === 404) {
     desktopRoutingState.connectedClientId = null;
     desktopRoutingState.registrationKey = null;
@@ -401,11 +438,19 @@ async function registerDesktopIdentity(identity) {
 
   const registrationKey = JSON.stringify(identity);
 
+  void reportClientDiagnostic("INFO", "desktop-registration-attempt", "Registering desktop client", {
+    clientId: desktopRoutingState.connectedClientId,
+    identity
+  });
   console.info("[ark-widget] registering desktop client", {
     clientId: desktopRoutingState.connectedClientId,
     identity
   });
   await commandStream.registerClient(identity);
+  void reportClientDiagnostic("INFO", "desktop-registration-complete", "Desktop client registration completed", {
+    clientId: desktopRoutingState.connectedClientId,
+    identity
+  });
   desktopRoutingState.registrationKey = registrationKey;
   desktopRoutingState.skippedIdentityKey = null;
   desktopRoutingState.registrationState = "registered";

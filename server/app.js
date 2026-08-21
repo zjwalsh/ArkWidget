@@ -17,12 +17,16 @@ const widgetAssetVersion = Date.now().toString();
 export function createArkWidgetApp(options = {}) {
   const mountPath = normalizeMountPath(options.mountPath ?? process.env.WIDGET_BASE_PATH ?? "/");
   const publicOrigin = normalizePublicOrigin(options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? "");
-  const ariesBaseUrl = options.ariesBaseUrl
+  const ariesBaseUrl = normalizeOptionalUrlString(
+    options.ariesBaseUrl
     ?? process.env.ARIES_API_BASE_URL
-    ?? "";
-  const ariesUploadUrl = options.ariesUploadUrl
+    ?? ""
+  ) ?? "";
+  const ariesUploadUrl = normalizeOptionalUrlString(
+    options.ariesUploadUrl
     ?? process.env.ARIES_API_UPLOAD_URL
-    ?? "";
+    ?? ""
+  ) ?? "";
   const ariesApiKey = options.ariesApiKey
     ?? process.env.ARIES_API_KEY
     ?? "";
@@ -157,6 +161,7 @@ export function createArkWidgetApp(options = {}) {
       thirdPartyNewCallEndpoint: ariesNewCallEndpoint,
       commandStreamPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/events")),
       desktopRegistrationPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/desktop-client")),
+      clientLogPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/client-log")),
       requireAgentDesktop
     };
 
@@ -260,6 +265,33 @@ export function createArkWidgetApp(options = {}) {
       taskIds: client.taskIds,
       interactionIds: client.interactionIds
     });
+  });
+
+  router.post("/api/client-log", (request, response) => {
+    const {
+      level = "INFO",
+      phase = "unknown",
+      message = "Client diagnostic event",
+      details = {}
+    } = request.body ?? {};
+    const normalizedLevel = String(level).toUpperCase();
+    const attributes = {
+      ...buildRequestContext(request),
+      phase,
+      details: details && typeof details === "object" ? details : { value: details }
+    };
+
+    if (normalizedLevel === "ERROR") {
+      logError(message, attributes);
+    } else if (normalizedLevel === "WARN") {
+      logWarn(message, attributes);
+    } else if (normalizedLevel === "DEBUG") {
+      logDebug(message, attributes);
+    } else {
+      logInfo(message, attributes);
+    }
+
+    response.status(202).json({ ok: true });
   });
 
   router.get("/api/desktop-clients", (request, response) => {
@@ -1060,6 +1092,17 @@ function normalizeOptionalString(value) {
   }
 
   return String(value);
+}
+
+function normalizeOptionalUrlString(value) {
+  const normalizedValue = normalizeOptionalString(value);
+
+  if (normalizedValue === null) {
+    return null;
+  }
+
+  const trimmedValue = normalizedValue.trim();
+  return trimmedValue === "" ? null : trimmedValue;
 }
 
 function validateCommandBasicAuth({ request, expectedUsername, expectedPassword }) {

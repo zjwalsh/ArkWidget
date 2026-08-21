@@ -5,6 +5,8 @@ const CONTACT_EVENT_NAMES = [
   "eAgentContact",
   "eAgentContactEnded"
 ];
+const AGENT_DESKTOP_READY_TIMEOUT_MS = 10000;
+const AGENT_DESKTOP_READY_POLL_INTERVAL_MS = 200;
 
 export class WxccClient {
   constructor(config) {
@@ -21,6 +23,8 @@ export class WxccClient {
     if (this.initialized) {
       return;
     }
+
+    await waitForAgentDesktopRuntime();
 
     if (!window.AGENTX_SERVICE) {
       throw new Error("Agent Desktop runtime is required but AGENTX_SERVICE is not available.");
@@ -278,6 +282,27 @@ export class WxccClient {
       return null;
     }
   }
+}
+
+async function waitForAgentDesktopRuntime({
+  timeoutMs = AGENT_DESKTOP_READY_TIMEOUT_MS,
+  pollIntervalMs = AGENT_DESKTOP_READY_POLL_INTERVAL_MS
+} = {}) {
+  if (window.AGENTX_SERVICE) {
+    return;
+  }
+
+  const startedAt = Date.now();
+
+  while (!window.AGENTX_SERVICE && Date.now() - startedAt < timeoutMs) {
+    await wait(pollIntervalMs);
+  }
+}
+
+function wait(durationMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
 }
 
 async function loadWxccDesktopSdk() {
