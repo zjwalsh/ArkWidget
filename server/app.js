@@ -147,7 +147,7 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.get("/config.js", (request, response) => {
-    const runtimeOrigin = publicOrigin || "";
+    const runtimeOrigin = publicOrigin || getRequestOrigin(request);
     const config = {
       widgetName: options.widgetName ?? process.env.WIDGET_NAME ?? "ark-widget",
       widgetProvider: options.widgetProvider ?? process.env.WIDGET_PROVIDER ?? "ArkWidget",
