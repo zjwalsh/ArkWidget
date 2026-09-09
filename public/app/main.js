@@ -6,6 +6,15 @@ import { AriesApiClient } from "./services/third-party-api.js";
 import { CommandStream } from "./services/command-stream.js";
 
 const config = getWidgetConfig();
+const CALL_LIFECYCLE_EVENT_NAMES = new Set([
+  "eAgentOfferContact",
+  "eAgentContact",
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged"
+]);
 const wxccClient = new WxccClient(config);
 const storeBridge = new AgentStoreBridge(wxccClient);
 const ariesApi = new AriesApiClient(config);
@@ -60,6 +69,7 @@ async function bootstrap() {
   refreshConnectionStatus();
 
   storeBridge.start(async (event) => {
+    traceInboundDesktopEvent(event);
     showDesktopEvent(event);
 
     try {
@@ -384,6 +394,13 @@ function showIdentifiers(identifiers) {
   getWidget()?.showIdentifiers(identifiers);
 }
 
+function traceInboundDesktopEvent(event) {
+  const details = summarizeDesktopEventForDiagnostics(event);
+
+  console.info("[ark-widget] inbound desktop event", details);
+  void reportClientDiagnostic("DEBUG", "desktop-event", "Inbound desktop event", details);
+}
+
 async function syncDesktopRouting(event) {
   if (!desktopRoutingState.connectedClientId) {
     return;
@@ -544,11 +561,7 @@ function isCallLifecycleEvent(event) {
     return false;
   }
 
-  if (![
-    "eAgentOfferContact",
-    "eAgentContact",
-    "eAgentContactEnded"
-  ].includes(event.eventName)) {
+  if (!CALL_LIFECYCLE_EVENT_NAMES.has(event.eventName)) {
     return false;
   }
 
@@ -673,6 +686,16 @@ function pickFirstDefinedValue(...values) {
 
 function resolveInteractionIdFromEvent(event) {
   return resolveInteractionIdFromPayload(event?.payload);
+}
+
+function summarizeDesktopEventForDiagnostics(event) {
+  return sanitizeDiagnosticValue({
+    source: event?.source ?? null,
+    type: event?.type ?? null,
+    eventName: event?.eventName ?? null,
+    detectedInteractionId: resolveInteractionIdFromEvent(event),
+    payload: event?.payload ?? null
+  });
 }
 
 function resolveInteractionIdFromPayload(payload) {
@@ -959,6 +982,46 @@ function resolveCurrentInteractionId() {
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeDiagnosticValue(value, depth = 0) {
+  if (depth > 5) {
+    return "[max-depth]";
+  }
+
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return value.length > 2000 ? `${value.slice(0, 2000)}...[${value.length - 2000} more chars]` : value;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack ?? null
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 25).map((entry) => sanitizeDiagnosticValue(entry, depth + 1));
+  }
+
+  if (!isPlainObject(value)) {
+    return String(value);
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .slice(0, 50)
+      .map(([key, entryValue]) => [key, sanitizeDiagnosticValue(entryValue, depth + 1)])
+  );
 }
 
 function summarizeCommandResultForDisplay(command, result) {

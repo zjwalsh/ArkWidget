@@ -13,6 +13,17 @@ const nodeModulesDir = path.resolve(__dirname, "../node_modules");
 const recordingsDir = path.resolve(__dirname, "../logs/recordings");
 const commandResultsDir = path.resolve(__dirname, "../logs/command-results");
 const widgetAssetVersion = Date.now().toString();
+const CALL_START_EVENT_NAMES = new Set([
+  "eAgentOfferContact",
+  "eAgentContact"
+]);
+const CALL_END_EVENT_NAMES = new Set([
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged"
+]);
 
 export function createArkWidgetApp(options = {}) {
   const mountPath = normalizeMountPath(options.mountPath ?? process.env.WIDGET_BASE_PATH ?? "/");
@@ -892,8 +903,8 @@ function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecyc
   const eventName = normalizeOptionalString(body?.eventName);
   const interactionId = resolveInteractionId(body);
   const eventTime = normalizeEpochTimeToIso(eventData?.eventTime, timeZone);
-  const isStartEvent = ["eAgentOfferContact", "eAgentContact"].includes(eventName);
-  const isEndEvent = eventName === "eAgentContactEnded";
+  const isStartEvent = CALL_START_EVENT_NAMES.has(eventName);
+  const isEndEvent = CALL_END_EVENT_NAMES.has(eventName);
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
     : null;

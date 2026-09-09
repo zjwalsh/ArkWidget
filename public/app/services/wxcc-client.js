@@ -1,9 +1,38 @@
 import { MediaCaptureService } from "./media-capture.js";
 
 const CONTACT_EVENT_NAMES = [
-  "eAgentOfferContact",
   "eAgentContact",
-  "eAgentContactEnded"
+  "eAgentContactAssigned",
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentContactAniUpdated",
+  "eAgentOfferContact",
+  "eAgentOfferContactRona",
+  "eAgentOfferConsult",
+  "eAgentContactHeld",
+  "eAgentContactUnHeld",
+  "eCallRecordingStarted",
+  "eAgentConsultCreated",
+  "eAgentConsultConferenced",
+  "eAgentConsultEnded",
+  "eAgentCtqCancelled",
+  "eAgentConsulting",
+  "eAgentConsultFailed",
+  "eAgentConsultEndFailed",
+  "eAgentCtqFailed",
+  "eAgentCtqCancelFailed",
+  "eAgentConsultConferenceEndFailed",
+  "eAgentMonitorStateChanged",
+  "eAgentMonitoringEnded",
+  "eAgentOfferCampaignReserved",
+  "eAgentAddCampaignReserved",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged",
+  "eParticipantJoinedConference",
+  "eParticipantLeftConference",
+  "eAgentConsultConferencing",
+  "eAgentConsultConferenceEnded"
 ];
 const AGENT_DESKTOP_READY_TIMEOUT_MS = 10000;
 const AGENT_DESKTOP_READY_POLL_INTERVAL_MS = 200;
