@@ -47,7 +47,7 @@ export class AriesApiClient {
       ? delivery.endpoint
       : "/telephonic-signatures";
     const method = typeof delivery.method === "string" ? delivery.method : "POST";
-    const extraBody = isPlainObject(delivery.extraBody) ? delivery.extraBody : {};
+    //const extraBody = isPlainObject(delivery.extraBody) ? delivery.extraBody : {};
     const metadata = isPlainObject(captureResult?.metadata) ? captureResult.metadata : {};
     const body = {
       dialogId: firstNonEmptyValue(metadata.dialogId, metadata.interactionId),
@@ -65,8 +65,7 @@ export class AriesApiClient {
       suffix: firstNonEmptyValue(metadata.suffix, metadata.sufxName),
       dob: firstNonEmptyValue(metadata.dob, metadata.dobDt),
       docBlob: captureResult?.audioBase64 ?? null,
-      fileType: firstNonEmptyValue(metadata.fileType, "WAV"),
-      ...extraBody
+      fileType: firstNonEmptyValue(metadata.fileType, "WAV")
     };
 
     if (delivery.includeCommand === true) {
