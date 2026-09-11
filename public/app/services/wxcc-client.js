@@ -1,5 +1,42 @@
 import { MediaCaptureService } from "./media-capture.js";
 
+const CONTACT_EVENT_NAMES = [
+  "eAgentContact",
+  "eAgentContactAssigned",
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentContactAniUpdated",
+  "eAgentOfferContact",
+  "eAgentOfferContactRona",
+  "eAgentOfferConsult",
+  "eAgentContactHeld",
+  "eAgentContactUnHeld",
+  "eCallRecordingStarted",
+  "eAgentConsultCreated",
+  "eAgentConsultConferenced",
+  "eAgentConsultEnded",
+  "eAgentCtqCancelled",
+  "eAgentConsulting",
+  "eAgentConsultFailed",
+  "eAgentConsultEndFailed",
+  "eAgentCtqFailed",
+  "eAgentCtqCancelFailed",
+  "eAgentConsultConferenceEndFailed",
+  "eAgentMonitorStateChanged",
+  "eAgentMonitoringEnded",
+  "eAgentOfferCampaignReserved",
+  "eAgentAddCampaignReserved",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged",
+  "eParticipantJoinedConference",
+  "eParticipantLeftConference",
+  "eAgentConsultConferencing",
+  "eAgentConsultConferenceEnded"
+];
+const AGENT_DESKTOP_READY_TIMEOUT_MS = 10000;
+const AGENT_DESKTOP_READY_POLL_INTERVAL_MS = 200;
+
 export class WxccClient {
   constructor(config) {
     this.config = config;
@@ -15,6 +52,8 @@ export class WxccClient {
     if (this.initialized) {
       return;
     }
+
+    await waitForAgentDesktopRuntime();
 
     if (!window.AGENTX_SERVICE) {
       throw new Error("Agent Desktop runtime is required but AGENTX_SERVICE is not available.");
@@ -60,22 +99,22 @@ export class WxccClient {
       listener({ source: "sdk", type: "dialer-event", eventName: "eOutdialFailed", payload: message });
     };
 
-    const offerContactListener = createContactListener(listener, "eAgentOfferContact");
-    const activeContactListener = createContactListener(listener, "eAgentContact");
-    const contactEndedListener = createContactListener(listener, "eAgentContactEnded");
+    const contactListeners = new Map(
+      CONTACT_EVENT_NAMES.map((eventName) => [eventName, createContactListener(listener, eventName)])
+    );
 
     this.desktop.agentStateInfo.addEventListener("updated", stateListener);
     this.desktop.dialer?.addEventListener?.("eOutdialFailed", outdialFailedListener);
-    this.desktop.agentContact.addEventListener("eAgentContact", activeContactListener);
-    this.desktop.agentContact.addEventListener("eAgentOfferContact", offerContactListener);
-    this.desktop.agentContact.addEventListener("eAgentContactEnded", contactEndedListener);
+    contactListeners.forEach((contactListener, eventName) => {
+      this.desktop.agentContact.addEventListener(eventName, contactListener);
+    });
 
     return () => {
       this.desktop.agentStateInfo.removeEventListener("updated", stateListener);
       this.desktop.dialer?.removeEventListener?.("eOutdialFailed", outdialFailedListener);
-      this.desktop.agentContact.removeEventListener("eAgentContact", activeContactListener);
-      this.desktop.agentContact.removeEventListener("eAgentOfferContact", offerContactListener);
-      this.desktop.agentContact.removeEventListener("eAgentContactEnded", contactEndedListener);
+      contactListeners.forEach((contactListener, eventName) => {
+        this.desktop.agentContact.removeEventListener(eventName, contactListener);
+      });
     };
   }
 
@@ -272,6 +311,27 @@ export class WxccClient {
       return null;
     }
   }
+}
+
+async function waitForAgentDesktopRuntime({
+  timeoutMs = AGENT_DESKTOP_READY_TIMEOUT_MS,
+  pollIntervalMs = AGENT_DESKTOP_READY_POLL_INTERVAL_MS
+} = {}) {
+  if (window.AGENTX_SERVICE) {
+    return;
+  }
+
+  const startedAt = Date.now();
+
+  while (!window.AGENTX_SERVICE && Date.now() - startedAt < timeoutMs) {
+    await wait(pollIntervalMs);
+  }
+}
+
+function wait(durationMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
 }
 
 async function loadWxccDesktopSdk() {

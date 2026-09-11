@@ -133,6 +133,35 @@ The host now registers both custom element names:
 
 If `script` points at `https://your-host.example.com/` instead of `https://your-host.example.com/desktop.js`, Agent Desktop loads HTML instead of JavaScript and the page stays blank even though the navigation tab appears.
 
+## Listing connected agents
+
+The server keeps an in-memory list of currently connected desktop clients after they open the SSE stream and register their identity.
+
+Use this endpoint to inspect the live connections and their agent IDs:
+
+```bash
+curl http://localhost:3000/api/desktop-clients
+```
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "connectedClients": 1,
+  "clients": [
+    {
+      "clientId": "1f7cf9e6-4e62-4e31-bad2-c8e7ad8bfe58",
+      "agentId": "9001234",
+      "agentAliases": ["jane.doe@example.com"],
+      "taskIds": ["eb3f5b4c-764f-4f82-a971-6ce53fdb4018"]
+    }
+  ]
+}
+```
+
+If a browser is connected but has not completed desktop registration yet, its `agentId` stays `null` until the widget reports its identity.
+
 ## Hosting Under Another Node Server
 
 The widget host is now mountable under any path instead of assuming `/`.
@@ -191,12 +220,15 @@ ARIES_API_BASE_URL=https://api.example.com
 ARIES_API_UPLOAD_URL=https://api.example.com
 ARIES_API_KEY=replace-me
 ARIES_API_TIMEOUT_MS=10000
+ARIES_TIME_ZONE=America/Chicago
 ARIES_NEW_CALL_ENDPOINT=/contact-arrivals
 ARIES_RECORD_TRANSACTION_ENDPOINT=/recordtransaction
 ARIES_CONSENT_RECORDING_FIELD_NAME=JW_Aries_consentRecComp
 ARIES_CONSENT_SCRIPT_PLAYED_FIELD_NAME=JW_Aries_consentScrPlayedSw
 ARIES_COMMAND_USERNAME=aries-user
 ARIES_COMMAND_PASSWORD=replace-me
+DESKTOP_ORPHAN_CLIENT_MAX_AGE_MS=60000
+DESKTOP_ORPHAN_CLIENT_SWEEP_INTERVAL_MS=15000
 ```
 
 Legacy `THIRD_PARTY_*` names are still accepted for backward compatibility, but new config should use `ARIES_*`.
@@ -204,6 +236,8 @@ Legacy `THIRD_PARTY_*` names are still accepted for backward compatibility, but 
 When both `ARIES_COMMAND_USERNAME` and `ARIES_COMMAND_PASSWORD` are set, inbound commands to `/api/desktop-command` require HTTP Basic authentication. Requests without valid credentials are rejected with `401 Unauthorized`.
 
 When `ARIES_CONSENT_RECORDING_FIELD_NAME` and/or `ARIES_CONSENT_SCRIPT_PLAYED_FIELD_NAME` are configured, the server inspects incoming event JSON for a nested `callAssociatedData` object, extracts those configured field names server-side, logs the received payload, and forwards the resolved values to Aries as a top-level `trackedCallAssociatedData` object.
+
+The server also purges stale SSE desktop clients that never register an `agentId`. By default, an unregistered client is removed after 60 seconds, and the sweep runs every 15 seconds. This helps clear orphaned client IDs and forces the browser to reconnect cleanly.
 
 ## Logging
 

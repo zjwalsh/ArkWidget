@@ -6,6 +6,15 @@ import { AriesApiClient } from "./services/third-party-api.js";
 import { CommandStream } from "./services/command-stream.js";
 
 const config = getWidgetConfig();
+const CALL_LIFECYCLE_EVENT_NAMES = new Set([
+  "eAgentOfferContact",
+  "eAgentContact",
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged"
+]);
 const wxccClient = new WxccClient(config);
 const storeBridge = new AgentStoreBridge(wxccClient);
 const ariesApi = new AriesApiClient(config);
@@ -20,7 +29,14 @@ const runtimeViewState = {
 const desktopRoutingState = {
   connectedClientId: null,
   registrationKey: null,
-  skippedIdentityKey: null
+  skippedIdentityKey: null,
+  lastKnownIdentity: null,
+  registrationRetryTimerId: null,
+  wxccReady: false,
+  monitoringActive: false,
+  commandStreamConnected: false,
+  registrationState: "idle",
+  registrationError: null
 };
 
 window.__ARK_WIDGET_ATTACH__ = (attachedWidget) => {
@@ -36,23 +52,30 @@ if (!widget) {
 syncWidget(widget);
 
 bootstrap().catch((error) => {
+  void reportClientDiagnostic("ERROR", "bootstrap-failed", error.message, {
+    stack: error?.stack ?? null
+  });
   updateStatus("Initialization failed");
   showDesktopEvent({ error: error.message });
   console.error(error);
 });
 
 async function bootstrap() {
+  void reportClientDiagnostic("INFO", "bootstrap-start", "Bootstrap started");
   updateStatus("Initializing WXCC SDK");
   await wxccClient.init();
-  updateStatus("Connected to Agent Desktop");
+  void reportClientDiagnostic("INFO", "wxcc-init-complete", "WXCC SDK initialized");
+  desktopRoutingState.wxccReady = true;
+  refreshConnectionStatus();
 
   storeBridge.start(async (event) => {
+    traceInboundDesktopEvent(event);
     showDesktopEvent(event);
 
     try {
       await syncDesktopRouting(event);
     } catch (error) {
-      showCommand({ registrationError: error.message });
+      handleDesktopRoutingError(error);
     }
 
     if (isCallLifecycleEvent(event)) {
@@ -63,22 +86,66 @@ async function bootstrap() {
       }
     }
 
-    updateStatus("Agent Desktop monitoring active");
+    desktopRoutingState.monitoringActive = true;
+    refreshConnectionStatus();
   });
 
   commandStream.connect({
     onReady: async (payload) => {
-      desktopRoutingState.connectedClientId = payload?.clientId ?? null;
+      void reportClientDiagnostic("INFO", "command-stream-ready", "Command stream ready", {
+        clientId: payload?.clientId ?? null
+      });
+      const nextClientId = payload?.clientId ?? null;
+
+      if (desktopRoutingState.connectedClientId !== nextClientId) {
+        desktopRoutingState.registrationKey = null;
+        desktopRoutingState.skippedIdentityKey = null;
+        desktopRoutingState.registrationState = "pending";
+        desktopRoutingState.registrationError = null;
+        clearDesktopRegistrationRetry();
+      }
+
+      desktopRoutingState.connectedClientId = nextClientId;
+      desktopRoutingState.commandStreamConnected = true;
+      refreshConnectionStatus();
+
+      if (desktopRoutingState.lastKnownIdentity) {
+        try {
+          await registerDesktopIdentity(desktopRoutingState.lastKnownIdentity);
+          return;
+        } catch (error) {
+          handleDesktopRoutingError(error);
+        }
+      }
 
       if (runtimeViewState.latestEvent) {
         try {
           await syncDesktopRouting(runtimeViewState.latestEvent);
         } catch (error) {
-          showCommand({ registrationError: error.message });
+          handleDesktopRoutingError(error);
         }
       }
     },
-    onStatus: (message) => updateStatus(message),
+    onStatus: (message) => {
+      void reportClientDiagnostic(
+        message === "Command stream connection issue" ? "WARN" : "INFO",
+        "command-stream-status",
+        message
+      );
+      if (message === "Command stream connected") {
+        desktopRoutingState.commandStreamConnected = true;
+      }
+
+      if (message === "Command stream connection issue") {
+        desktopRoutingState.commandStreamConnected = false;
+        desktopRoutingState.connectedClientId = null;
+        desktopRoutingState.registrationKey = null;
+        desktopRoutingState.skippedIdentityKey = null;
+        clearDesktopRegistrationRetry();
+      }
+
+      refreshConnectionStatus(message);
+    },
     onCommand: async (command) => {
       const resolvedCommand = enrichCommandWithCurrentInteraction(command);
       showCommand(resolvedCommand);
@@ -95,6 +162,9 @@ async function bootstrap() {
           && resolvedCommand?.payload?.delivery
         ) {
           const deliveryResponse = await ariesApi.sendCapturedAudio(resolvedCommand, result);
+          await ariesApi.sendRecordTransactionEvent(
+            buildRecordingSendCompleteEvent(resolvedCommand, result, deliveryResponse)
+          );
           showCommand({
             command: resolvedCommand,
             result: {
@@ -195,6 +265,119 @@ function updateStatus(message) {
   getWidget()?.updateStatus(message);
 }
 
+async function reportClientDiagnostic(level, phase, message, details = {}) {
+  if (!config.clientLogPath) {
+    return;
+  }
+
+  try {
+    await fetch(config.clientLogPath, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        level,
+        phase,
+        message,
+        details
+      })
+    });
+  } catch {
+    // Ignore client diagnostic transport failures.
+  }
+}
+
+function refreshConnectionStatus(fallbackMessage = null) {
+  if (!desktopRoutingState.wxccReady) {
+    updateStatus(fallbackMessage ?? "Initializing WXCC SDK");
+    return;
+  }
+
+  if (!desktopRoutingState.commandStreamConnected) {
+    updateStatus("Connected to Agent Desktop. Host connection lost, retrying...");
+    return;
+  }
+
+  if (desktopRoutingState.registrationState === "registered") {
+    updateStatus("Agent Desktop monitoring active. Host connected and registered.");
+    return;
+  }
+
+  if (desktopRoutingState.registrationState === "waiting-identity") {
+    updateStatus("Agent Desktop monitoring active. Host connected, waiting for agent identity.");
+    return;
+  }
+
+  if (desktopRoutingState.registrationState === "error") {
+    updateStatus(`Host connected, registration failed: ${desktopRoutingState.registrationError ?? "Unknown error"}`);
+    return;
+  }
+
+  if (desktopRoutingState.monitoringActive) {
+    updateStatus("Agent Desktop monitoring active. Host connected, registration pending.");
+    return;
+  }
+
+  updateStatus(fallbackMessage ?? "Connected to Agent Desktop");
+}
+
+function handleDesktopRoutingError(error) {
+  void reportClientDiagnostic("ERROR", "desktop-routing-error", error instanceof Error ? error.message : String(error));
+  if (error?.status === 404) {
+    desktopRoutingState.connectedClientId = null;
+    desktopRoutingState.registrationKey = null;
+    desktopRoutingState.skippedIdentityKey = null;
+    desktopRoutingState.commandStreamConnected = false;
+    desktopRoutingState.registrationState = "pending";
+    desktopRoutingState.registrationError = null;
+    clearDesktopRegistrationRetry();
+    refreshConnectionStatus();
+    commandStream.reconnectNow();
+    return;
+  }
+
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  desktopRoutingState.registrationState = "error";
+  desktopRoutingState.registrationError = errorMessage;
+  refreshConnectionStatus();
+  showCommand({ registrationError: errorMessage });
+  scheduleDesktopRegistrationRetry();
+}
+
+function scheduleDesktopRegistrationRetry() {
+  if (
+    desktopRoutingState.registrationRetryTimerId !== null
+    || !desktopRoutingState.commandStreamConnected
+    || !desktopRoutingState.connectedClientId
+  ) {
+    return;
+  }
+
+  desktopRoutingState.registrationRetryTimerId = window.setTimeout(async () => {
+    desktopRoutingState.registrationRetryTimerId = null;
+
+    if (!runtimeViewState.latestEvent || !desktopRoutingState.connectedClientId) {
+      return;
+    }
+
+    try {
+      await syncDesktopRouting(runtimeViewState.latestEvent);
+    } catch (error) {
+      handleDesktopRoutingError(error);
+    }
+  }, 1000);
+}
+
+function clearDesktopRegistrationRetry() {
+  if (desktopRoutingState.registrationRetryTimerId === null) {
+    return;
+  }
+
+  window.clearTimeout(desktopRoutingState.registrationRetryTimerId);
+  desktopRoutingState.registrationRetryTimerId = null;
+}
+
 function showDesktopEvent(event) {
   runtimeViewState.latestEvent = event;
   getWidget()?.showDesktopEvent(event);
@@ -211,6 +394,13 @@ function showIdentifiers(identifiers) {
   getWidget()?.showIdentifiers(identifiers);
 }
 
+function traceInboundDesktopEvent(event) {
+  const details = summarizeDesktopEventForDiagnostics(event);
+
+  console.info("[ark-widget] inbound desktop event", details);
+  void reportClientDiagnostic("DEBUG", "desktop-event", "Inbound desktop event", details);
+}
+
 async function syncDesktopRouting(event) {
   if (!desktopRoutingState.connectedClientId) {
     return;
@@ -218,7 +408,12 @@ async function syncDesktopRouting(event) {
 
   const identity = extractDesktopIdentity(event);
 
-  if (!identity.agentId && identity.agentAliases.length === 0 && identity.taskIds.length === 0) {
+  if (
+    !identity.agentId
+    && identity.agentAliases.length === 0
+    && identity.taskIds.length === 0
+    && identity.interactionIds.length === 0
+  ) {
     const skippedIdentityKey = JSON.stringify({
       source: event?.source ?? null,
       type: event?.type ?? null,
@@ -228,6 +423,9 @@ async function syncDesktopRouting(event) {
 
     if (skippedIdentityKey !== desktopRoutingState.skippedIdentityKey) {
       desktopRoutingState.skippedIdentityKey = skippedIdentityKey;
+      desktopRoutingState.registrationState = "waiting-identity";
+      desktopRoutingState.registrationError = null;
+      refreshConnectionStatus();
       console.info("[ark-widget] desktop registration skipped", {
         clientId: desktopRoutingState.connectedClientId,
         source: event?.source ?? null,
@@ -241,30 +439,121 @@ async function syncDesktopRouting(event) {
   }
 
   const registrationKey = JSON.stringify(identity);
+  desktopRoutingState.lastKnownIdentity = identity;
 
   if (registrationKey === desktopRoutingState.registrationKey) {
     return;
   }
 
+  await registerDesktopIdentity(identity);
+}
+
+async function registerDesktopIdentity(identity) {
+  if (!desktopRoutingState.connectedClientId) {
+    return;
+  }
+
+  const registrationKey = JSON.stringify(identity);
+
+  void reportClientDiagnostic("INFO", "desktop-registration-attempt", "Registering desktop client", {
+    clientId: desktopRoutingState.connectedClientId,
+    identity
+  });
   console.info("[ark-widget] registering desktop client", {
     clientId: desktopRoutingState.connectedClientId,
     identity
   });
   await commandStream.registerClient(identity);
+  void reportClientDiagnostic("INFO", "desktop-registration-complete", "Desktop client registration completed", {
+    clientId: desktopRoutingState.connectedClientId,
+    identity
+  });
   desktopRoutingState.registrationKey = registrationKey;
   desktopRoutingState.skippedIdentityKey = null;
+  desktopRoutingState.registrationState = "registered";
+  desktopRoutingState.registrationError = null;
+  clearDesktopRegistrationRetry();
+  refreshConnectionStatus();
 }
 
 async function handleCallLifecycleEvent(event) {
-  const payload = {
-    ...event,
-    detectedAt: new Date().toISOString()
-  };
+  const payload = buildLifecycleEventPayload(event);
 
-  await Promise.all([
-    ariesApi.sendNewCallEvent(payload),
-    ariesApi.sendRecordTransactionEvent(payload)
+  console.info("[ark-widget] call lifecycle event", {
+    eventName: event?.eventName ?? null,
+    interactionId: resolveCurrentInteractionId(),
+    detectedAt: payload.detectedAt
+  });
+
+  await ariesApi.sendRecordTransactionEvent(payload);
+}
+
+function buildLifecycleEventPayload(event) {
+  const storeState = safelyGetStoreState();
+  const eventPayload = isPlainObject(event?.payload) ? event.payload : {};
+  const eventData = isPlainObject(eventPayload.data) ? eventPayload.data : {};
+  const interactionData = isPlainObject(eventData.interaction)
+    ? eventData.interaction
+    : isPlainObject(eventPayload.interaction)
+      ? eventPayload.interaction
+      : {};
+  const interactionId = pickFirstString([
+    eventData?.interactionId,
+    interactionData?.interactionId,
+    resolveCurrentInteractionId()
   ]);
+  const agentEmailId = resolveCurrentAgentEmail([
+    eventPayload,
+    storeState,
+    wxccClient.getAgentSnapshot()
+  ]);
+
+  return {
+    ...event,
+    detectedAt: new Date().toISOString(),
+    payload: {
+      ...eventPayload,
+      interactionId: eventPayload.interactionId ?? interactionId,
+      interaction: {
+        ...(isPlainObject(eventPayload.interaction) ? eventPayload.interaction : {}),
+        interactionId: eventPayload?.interaction?.interactionId ?? interactionId
+      },
+      data: {
+        ...eventData,
+        interactionId: eventData.interactionId ?? interactionId,
+        interaction: {
+          ...interactionData,
+          interactionId: interactionData.interactionId ?? interactionId
+        },
+        agentEmailId: eventData.agentEmailId ?? agentEmailId,
+        hostName: eventData.hostName ?? eventPayload.hostName ?? "Webex.com"
+      },
+      storeState
+    }
+  };
+}
+
+function resolveCurrentAgentEmail(sources) {
+  return pickFirstString(
+    sources.flatMap((source) => {
+      if (!source || typeof source !== "object") {
+        return [];
+      }
+
+      return [
+        source?.agentSession?.agentEmailId,
+        source?.agentSession?.agentInfo?.email,
+        source?.agentSession?.agentInfo?.agentEmailId,
+        source?.agentProfile?.email,
+        source?.agentProfile?.agentEmailId,
+        source?.agentState?.agentEmailId,
+        source?.agentState?.latestData?.agentEmailId,
+        source?.data?.agentEmailId,
+        ...findNestedValuesByKey(source, "agentemailid"),
+        ...findNestedValuesByKey(source, "email")
+      ];
+    })
+  );
 }
 
 function isCallLifecycleEvent(event) {
@@ -272,7 +561,7 @@ function isCallLifecycleEvent(event) {
     return false;
   }
 
-  if (!["eAgentOfferContact", "eAgentContactEnded"].includes(event.eventName)) {
+  if (!CALL_LIFECYCLE_EVENT_NAMES.has(event.eventName)) {
     return false;
   }
 
@@ -289,8 +578,139 @@ function isCallLifecycleEvent(event) {
     return true;
   }
 
-  return ["telephony", "call"].includes(String(mediaType).toLowerCase());
+  const normalizedMediaType = String(mediaType).toLowerCase();
+
+  return normalizedMediaType.includes("telephony")
+    || normalizedMediaType.includes("call")
+    || normalizedMediaType.includes("voice");
 }
+
+function buildRecordingSendCompleteEvent(command, captureResult, deliveryResponse) {
+  const latestPayload = runtimeViewState.latestEvent?.source === "sdk"
+    && runtimeViewState.latestEvent?.type === "agent-contact"
+    ? runtimeViewState.latestEvent.payload
+    : null;
+  const trackedCallAssociatedData = resolveTrackedCallAssociatedData(command, captureResult, deliveryResponse);
+  const interactionId = pickFirstString([
+    command?.payload?.interactionId,
+    command?.payload?.metadata?.interactionId,
+    captureResult?.metadata?.interactionId,
+    resolveCurrentInteractionId()
+  ]);
+
+  return {
+    source: "command",
+    type: "recording-send-complete",
+    eventName: "recordingSendComplete",
+    detectedAt: new Date().toISOString(),
+    payload: {
+      ...latestPayload,
+      data: {
+        ...(latestPayload?.data ?? {}),
+        eventTime: Date.now(),
+        interactionId: interactionId ?? latestPayload?.data?.interactionId ?? null,
+        interaction: {
+          ...(latestPayload?.data?.interaction ?? latestPayload?.interaction ?? {}),
+          interactionId: interactionId
+            ?? latestPayload?.data?.interaction?.interactionId
+            ?? latestPayload?.interaction?.interactionId
+            ?? null
+        },
+        agentEmailId: latestPayload?.data?.agentEmailId
+          ?? latestPayload?.agentEmailId
+          ?? null,
+        hostName: latestPayload?.data?.hostName
+          ?? latestPayload?.hostName
+          ?? "Webex.com"
+      },
+      metadata: {
+        ...(isPlainObject(latestPayload?.metadata) ? latestPayload.metadata : {}),
+        ...(isPlainObject(captureResult?.metadata) ? captureResult.metadata : {}),
+        deliveryResponse
+      },
+      ...(trackedCallAssociatedData ? { trackedCallAssociatedData } : {})
+    }
+  };
+}
+
+function resolveTrackedCallAssociatedData(command, captureResult, deliveryResponse) {
+  const metadataSources = [
+    command?.payload?.metadata,
+    captureResult?.metadata
+  ].filter(isPlainObject);
+
+  const directTrackedCallAssociatedData = metadataSources
+    .map((metadata) => metadata.trackedCallAssociatedData)
+    .find(isPlainObject);
+
+  if (directTrackedCallAssociatedData) {
+    return {
+      ...directTrackedCallAssociatedData
+    };
+  }
+
+  const consentRecordingComplete = pickFirstDefinedValue(
+    ...metadataSources.map((metadata) => metadata.consentRecordingComplete),
+    ...metadataSources.map((metadata) => metadata.signatureAccepted),
+    deliveryResponse !== undefined ? true : undefined
+  );
+  const consentScriptPlayed = pickFirstDefinedValue(
+    ...metadataSources.map((metadata) => metadata.consentScriptPlayed),
+    ...metadataSources.map((metadata) => metadata.signatureAccepted)
+  );
+
+  const trackedCallAssociatedData = {};
+
+  if (consentRecordingComplete !== undefined) {
+    trackedCallAssociatedData.consentRecordingComplete = consentRecordingComplete;
+  }
+
+  if (consentScriptPlayed !== undefined) {
+    trackedCallAssociatedData.consentScriptPlayed = consentScriptPlayed;
+  }
+
+  return Object.keys(trackedCallAssociatedData).length > 0
+    ? trackedCallAssociatedData
+    : null;
+}
+
+function pickFirstDefinedValue(...values) {
+  for (const value of values) {
+    if (value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveInteractionIdFromEvent(event) {
+  return resolveInteractionIdFromPayload(event?.payload);
+}
+
+function summarizeDesktopEventForDiagnostics(event) {
+  return sanitizeDiagnosticValue({
+    source: event?.source ?? null,
+    type: event?.type ?? null,
+    eventName: event?.eventName ?? null,
+    detectedInteractionId: resolveInteractionIdFromEvent(event),
+    payload: event?.payload ?? null
+  });
+}
+
+function resolveInteractionIdFromPayload(payload) {
+  return pickFirstString([
+    payload?.interactionId,
+    payload?.data?.interactionId,
+    payload?.interaction?.interactionId,
+    payload?.data?.interaction?.interactionId,
+    payload?.agentContact?.interactionId,
+    payload?.agentContact?.data?.interactionId,
+    payload?.agentContact?.contactData?.interactionId,
+    ...collectInteractionIds(payload ?? {})
+  ]);
+}
+
 
 function extractDesktopIdentity(event) {
   const payload = event?.payload ?? {};
@@ -390,6 +810,8 @@ function collectTaskIds(payload) {
     });
   }
 
+  findNestedValuesByKey(payload, "taskid").forEach((value) => addValue(taskIds, value));
+
   return Array.from(taskIds);
 }
 
@@ -410,6 +832,8 @@ function collectInteractionIds(payload) {
       addValue(interactionIds, taskValue?.contactData?.interactionId);
     });
   }
+
+  findNestedValuesByKey(payload, "interactionid").forEach((value) => addValue(interactionIds, value));
 
   return Array.from(interactionIds);
 }
@@ -558,6 +982,46 @@ function resolveCurrentInteractionId() {
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeDiagnosticValue(value, depth = 0) {
+  if (depth > 5) {
+    return "[max-depth]";
+  }
+
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return value.length > 2000 ? `${value.slice(0, 2000)}...[${value.length - 2000} more chars]` : value;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack ?? null
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 25).map((entry) => sanitizeDiagnosticValue(entry, depth + 1));
+  }
+
+  if (!isPlainObject(value)) {
+    return String(value);
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .slice(0, 50)
+      .map(([key, entryValue]) => [key, sanitizeDiagnosticValue(entryValue, depth + 1)])
+  );
 }
 
 function summarizeCommandResultForDisplay(command, result) {

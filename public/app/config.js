@@ -11,6 +11,7 @@ export function getWidgetConfig() {
     ariesRecordTransactionEndpoint: config.ariesRecordTransactionEndpoint ?? "/recordtransaction",
     commandStreamPath: config.commandStreamPath ?? "/events",
     desktopRegistrationPath: config.desktopRegistrationPath ?? "/api/desktop-client",
+    clientLogPath: config.clientLogPath ?? "/api/client-log",
     requireAgentDesktop: config.requireAgentDesktop ?? true
   };
 }

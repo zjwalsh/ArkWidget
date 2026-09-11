@@ -1,4 +1,5 @@
 import express from "express";
+import ffmpegStatic from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -12,16 +13,31 @@ const nodeModulesDir = path.resolve(__dirname, "../node_modules");
 const recordingsDir = path.resolve(__dirname, "../logs/recordings");
 const commandResultsDir = path.resolve(__dirname, "../logs/command-results");
 const widgetAssetVersion = Date.now().toString();
+const CALL_START_EVENT_NAMES = new Set([
+  "eAgentOfferContact",
+  "eAgentContact"
+]);
+const CALL_END_EVENT_NAMES = new Set([
+  "eAgentContactEnded",
+  "eAgentWrapup",
+  "eAgentContactWrappedUp",
+  "eAgentConsultTransferring",
+  "eContactOwnerChanged"
+]);
 
 export function createArkWidgetApp(options = {}) {
   const mountPath = normalizeMountPath(options.mountPath ?? process.env.WIDGET_BASE_PATH ?? "/");
   const publicOrigin = normalizePublicOrigin(options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? "");
-  const ariesBaseUrl = options.ariesBaseUrl
+  const ariesBaseUrl = normalizeOptionalUrlString(
+    options.ariesBaseUrl
     ?? process.env.ARIES_API_BASE_URL
-    ?? "";
-  const ariesUploadUrl = options.ariesUploadUrl
+    ?? ""
+  ) ?? "";
+  const ariesUploadUrl = normalizeOptionalUrlString(
+    options.ariesUploadUrl
     ?? process.env.ARIES_API_UPLOAD_URL
-    ?? "";
+    ?? ""
+  ) ?? "";
   const ariesApiKey = options.ariesApiKey
     ?? process.env.ARIES_API_KEY
     ?? "";
@@ -48,6 +64,9 @@ export function createArkWidgetApp(options = {}) {
   const ariesRecordTransactionEndpoint = options.ariesRecordTransactionEndpoint
     ?? process.env.ARIES_RECORD_TRANSACTION_ENDPOINT
     ?? "/recordtransaction";
+  const ariesTimeZone = options.ariesTimeZone
+    ?? process.env.ARIES_TIME_ZONE
+    ?? "America/Chicago";
   const trackedCallAssociatedDataFields = buildTrackedCallAssociatedDataFields({
     consentRecordingFieldName: options.ariesConsentRecordingFieldName
       ?? process.env.ARIES_CONSENT_RECORDING_FIELD_NAME,
@@ -61,10 +80,31 @@ export function createArkWidgetApp(options = {}) {
   const callLifecycleState = {
     callStartTimeByInteractionId: new Map()
   };
+  const orphanClientMaxAgeMs = Number.parseInt(
+    String(
+      options.orphanClientMaxAgeMs
+      ?? process.env.DESKTOP_ORPHAN_CLIENT_MAX_AGE_MS
+      ?? "60000"
+    ),
+    10
+  );
+  const orphanClientSweepIntervalMs = Number.parseInt(
+    String(
+      options.orphanClientSweepIntervalMs
+      ?? process.env.DESKTOP_ORPHAN_CLIENT_SWEEP_INTERVAL_MS
+      ?? "15000"
+    ),
+    10
+  );
 
 
   const requireAgentDesktop = toBoolean(options.requireAgentDesktop ?? process.env.REQUIRE_AGENT_DESKTOP, true);
   const sseClients = new Set();
+  const orphanClientSweep = startOrphanClientSweep({
+    clients: sseClients,
+    maxAgeMs: orphanClientMaxAgeMs,
+    sweepIntervalMs: orphanClientSweepIntervalMs
+  });
   const router = express.Router();
 
   router.use((request, response, next) => {
@@ -132,6 +172,7 @@ export function createArkWidgetApp(options = {}) {
       thirdPartyNewCallEndpoint: ariesNewCallEndpoint,
       commandStreamPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/events")),
       desktopRegistrationPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/desktop-client")),
+      clientLogPath: toRuntimeUrl(runtimeOrigin, joinMountPath(mountPath, "/api/client-log")),
       requireAgentDesktop
     };
 
@@ -141,6 +182,7 @@ export function createArkWidgetApp(options = {}) {
       ...buildRequestContext(request),
       mountPath,
       publicOrigin: publicOrigin || undefined,
+      runtimeOrigin: runtimeOrigin || undefined,
       requireAgentDesktop
     });
   });
@@ -148,9 +190,10 @@ export function createArkWidgetApp(options = {}) {
   router.get("/desktop.js", (_request, response) => {
     const configPath = joinMountPath(mountPath, "/config.js");
     const entryPath = joinMountPath(mountPath, "/app/main.js");
+    const requestAssetVersion = Date.now().toString();
 
     response.type("application/javascript");
-    response.send(buildDesktopBootstrapScript(configPath, entryPath, widgetAssetVersion));
+    response.send(buildDesktopBootstrapScript(configPath, entryPath, requestAssetVersion));
   });
 
   router.get("/events", (request, response) => {
@@ -162,9 +205,11 @@ export function createArkWidgetApp(options = {}) {
     const client = {
       id: crypto.randomUUID(),
       response,
+      connectedAt: Date.now(),
       agentId: null,
       agentAliases: [],
-      taskIds: []
+      taskIds: [],
+      interactionIds: []
     };
     sseClients.add(client);
     logInfo("Desktop command stream connected", {
@@ -186,7 +231,7 @@ export function createArkWidgetApp(options = {}) {
   });
 
   router.post("/api/desktop-client", (request, response) => {
-    const { clientId, agentId = null, agentAliases = [], taskIds = [] } = request.body ?? {};
+    const { clientId, agentId = null, agentAliases = [], taskIds = [], interactionIds = [] } = request.body ?? {};
 
     if (typeof clientId !== "string" || !clientId) {
       logWarn("Desktop client registration rejected", {
@@ -212,13 +257,15 @@ export function createArkWidgetApp(options = {}) {
     client.agentId = normalizeIdentityValue(agentId);
     client.agentAliases = normalizeIdentityList(agentAliases);
     client.taskIds = normalizeTaskIds(taskIds);
+    client.interactionIds = normalizeIdentityList(interactionIds);
 
     logInfo("Desktop client registered", {
       ...buildRequestContext(request),
       clientId: client.id,
       agentId: client.agentId,
       agentAliases: client.agentAliases,
-      taskIds: client.taskIds
+      taskIds: client.taskIds,
+      interactionIds: client.interactionIds
     });
 
     response.json({
@@ -226,7 +273,51 @@ export function createArkWidgetApp(options = {}) {
       clientId: client.id,
       agentId: client.agentId,
       agentAliases: client.agentAliases,
-      taskIds: client.taskIds
+      taskIds: client.taskIds,
+      interactionIds: client.interactionIds
+    });
+  });
+
+  router.post("/api/client-log", (request, response) => {
+    const {
+      level = "INFO",
+      phase = "unknown",
+      message = "Client diagnostic event",
+      details = {}
+    } = request.body ?? {};
+    const normalizedLevel = String(level).toUpperCase();
+    const attributes = {
+      ...buildRequestContext(request),
+      phase,
+      details: details && typeof details === "object" ? details : { value: details }
+    };
+
+    if (normalizedLevel === "ERROR") {
+      logError(message, attributes);
+    } else if (normalizedLevel === "WARN") {
+      logWarn(message, attributes);
+    } else if (normalizedLevel === "DEBUG") {
+      logDebug(message, attributes);
+    } else {
+      logInfo(message, attributes);
+    }
+
+    response.status(202).json({ ok: true });
+  });
+
+  router.get("/api/desktop-clients", (request, response) => {
+    const connectedClients = listConnectedClientIdentities(sseClients);
+
+    logInfo("Connected desktop clients listed", {
+      ...buildRequestContext(request),
+      connectedClients: connectedClients.length,
+      connectedClientIdentities: connectedClients
+    });
+
+    response.json({
+      ok: true,
+      connectedClients: connectedClients.length,
+      clients: connectedClients
     });
   });
 
@@ -270,12 +361,7 @@ export function createArkWidgetApp(options = {}) {
     }
 
     const targetClients = selectCommandTargets(sseClients, command);
-    const connectedClientIdentities = Array.from(sseClients).map((client) => ({
-      clientId: client.id,
-      agentId: client.agentId,
-      agentAliases: client.agentAliases,
-      taskIds: client.taskIds
-    }));
+    const connectedClientIdentities = listConnectedClientIdentities(sseClients);
 
     logInfo("Desktop command routed", {
       ...buildRequestContext(request),
@@ -296,6 +382,8 @@ export function createArkWidgetApp(options = {}) {
 
   router.post("/api/third-party/forward", async (request, response) => {
     const { endpoint = "/", method = "POST", body, headers = {}, useUploadApi = false } = request.body ?? {};
+    const sourceEventName = normalizeOptionalString(request.body?.body?.eventName);
+    const sourceInteractionId = resolveInteractionId(body);
 
     if (typeof endpoint !== "string" || !endpoint.startsWith("/")) {
       logWarn("Aries forward rejected", {
@@ -313,16 +401,28 @@ export function createArkWidgetApp(options = {}) {
       trackedState: trackedCallAssociatedDataState
     });
     const transformedBody = shouldTransformCallLifecyclePayload(endpoint, [
-      ariesNewCallEndpoint,
       ariesRecordTransactionEndpoint
     ])
       ? buildAriesNewCallPayload({
         body: trackedForwardContext.forwardBody,
         trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
-        callLifecycleState
+        callLifecycleState,
+        timeZone: ariesTimeZone
       })
       : trackedForwardContext.forwardBody;
     let finalForwardBody = transformedBody;
+
+    if (endpoint === ariesRecordTransactionEndpoint) {
+      logInfo("Aries call timing computed", {
+        ...buildRequestContext(request),
+        endpoint,
+        method,
+        sourceEventName,
+        sourceInteractionId,
+        callStartTime: transformedBody?.callStartTime ?? null,
+        callEndTime: transformedBody?.callEndTime ?? null
+      });
+    }
 
     if (useUploadApi) {
       try {
@@ -355,11 +455,36 @@ export function createArkWidgetApp(options = {}) {
       endpoint,
       method,
       useUploadApi,
+      sourceEventName,
+      sourceInteractionId,
+      lifecyclePayloadTransformed: shouldTransformCallLifecyclePayload(endpoint, [ariesRecordTransactionEndpoint]),
       interactionId: trackedForwardContext.interactionId,
       trackedCallAssociatedData: trackedForwardContext.trackedCallAssociatedData,
       extractedTrackedCallAssociatedData: trackedForwardContext.extractedTrackedCallAssociatedData,
       body: sanitizeForwardBodyForLog(forwardRequest.body)
     });
+
+    if (endpoint === "/command-results") {
+      const savedCommandResult = await maybePersistCommandResult({
+        body: forwardRequest,
+        commandResultsDir,
+        requestId: request.requestId
+      });
+
+      logInfo("Command result kept local", {
+        ...buildRequestContext(request),
+        endpoint,
+        savedCommandResultPath: savedCommandResult?.filePath ?? null,
+        commandType: savedCommandResult?.commandType ?? null
+      });
+
+      response.status(202).json({
+        accepted: true,
+        forwardedToAries: false,
+        savedCommandResult
+      });
+      return;
+    }
 
     const destinationBaseUrl = useUploadApi && ariesUploadUrl
       ? ariesUploadUrl
@@ -398,7 +523,9 @@ export function createArkWidgetApp(options = {}) {
       return;
     }
 
-    const url = resolveAriesUrl(destinationBaseUrl, endpoint);
+    const url = useUploadApi
+      ? new URL(destinationBaseUrl)
+      : resolveAriesUrl(destinationBaseUrl, endpoint);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ariesTimeoutMs);
     const startedAt = Date.now();
@@ -463,6 +590,7 @@ export function createArkWidgetApp(options = {}) {
   app.use(express.json({ limit: "10mb" }));
   app.use(mountPath, router);
   app.locals.arkWidgetMountPath = mountPath;
+  app.locals.arkWidgetOrphanClientSweep = orphanClientSweep;
   return app;
 }
 
@@ -505,27 +633,51 @@ function buildTrackedCallAssociatedDataFields({ consentRecordingFieldName, conse
   return [
     {
       outputKey: "consentRecordingComplete",
-      fieldName: normalizeOptionalString(consentRecordingFieldName)
+      fieldNames: buildTrackedFieldNameCandidates(
+        consentRecordingFieldName,
+        ["consentRecordingComplete", "consentRecComp"]
+      )
     },
     {
       outputKey: "consentScriptPlayed",
-      fieldName: normalizeOptionalString(consentScriptPlayedFieldName)
+      fieldNames: buildTrackedFieldNameCandidates(
+        consentScriptPlayedFieldName,
+        ["consentScriptPlayed", "consentScrPlayedSw"]
+      )
     }
-  ].filter((definition) => Boolean(definition.fieldName));
+  ].filter((definition) => definition.fieldNames.length > 0);
+}
+
+function buildTrackedFieldNameCandidates(configuredFieldName, fallbackFieldNames = []) {
+  const configuredName = normalizeOptionalString(configuredFieldName);
+
+  return Array.from(new Set([
+    configuredName,
+    ...fallbackFieldNames.map((fieldName) => normalizeOptionalString(fieldName))
+  ].filter(Boolean)));
 }
 
 export function resolveTrackedCallAssociatedDataContext({ body, trackedFieldDefinitions, trackedState }) {
+  const directTrackedCallAssociatedData = normalizeDirectTrackedCallAssociatedData(
+    body?.trackedCallAssociatedData
+    ?? body?.payload?.trackedCallAssociatedData
+    ?? body?.payload?.data?.trackedCallAssociatedData
+  );
+
   if (!Array.isArray(trackedFieldDefinitions) || trackedFieldDefinitions.length === 0) {
     return {
       interactionId: resolveInteractionId(body),
-      extractedTrackedCallAssociatedData: null,
-      trackedCallAssociatedData: null,
+      extractedTrackedCallAssociatedData: directTrackedCallAssociatedData,
+      trackedCallAssociatedData: directTrackedCallAssociatedData,
       forwardBody: body
     };
   }
 
   const interactionId = resolveInteractionId(body);
-  const extractedTrackedCallAssociatedData = extractTrackedCallAssociatedData(body, trackedFieldDefinitions);
+  const extractedTrackedCallAssociatedData = mergeTrackedCallAssociatedData(
+    extractTrackedCallAssociatedData(body, trackedFieldDefinitions),
+    directTrackedCallAssociatedData
+  );
   const trackedByInteraction = interactionId
     ? trackedState?.byInteractionId?.get?.(interactionId) ?? null
     : null;
@@ -561,15 +713,39 @@ export function resolveTrackedCallAssociatedDataContext({ body, trackedFieldDefi
   };
 }
 
-function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
-  const callAssociatedData = findFirstNestedObjectByNormalizedKey(body, "callassociateddata");
-
-  if (!callAssociatedData) {
+function normalizeDirectTrackedCallAssociatedData(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
 
+  const normalizedTrackedCallAssociatedData = {};
+
+  if (value.consentRecordingComplete !== undefined) {
+    normalizedTrackedCallAssociatedData.consentRecordingComplete = normalizeTrackedFieldValue(
+      value.consentRecordingComplete
+    );
+  }
+
+  if (value.consentScriptPlayed !== undefined) {
+    normalizedTrackedCallAssociatedData.consentScriptPlayed = normalizeTrackedFieldValue(
+      value.consentScriptPlayed
+    );
+  }
+
+  return hasTrackedCallAssociatedData(normalizedTrackedCallAssociatedData)
+    ? normalizedTrackedCallAssociatedData
+    : null;
+}
+
+function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
+  const trackedSources = findTrackedFieldSources(body);
+
   const extracted = trackedFieldDefinitions.reduce((result, definition) => {
-    const fieldValue = readCallAssociatedDataValue(callAssociatedData, definition.fieldName);
+    const fieldValue = readTrackedFieldValue({
+      body,
+      trackedSources,
+      fieldNames: definition.fieldNames
+    });
 
     if (fieldValue !== null) {
       result[definition.outputKey] = fieldValue;
@@ -581,12 +757,73 @@ function extractTrackedCallAssociatedData(body, trackedFieldDefinitions) {
   return Object.keys(extracted).length > 0 ? extracted : null;
 }
 
+function findTrackedFieldSources(body) {
+  const preferredSources = [
+    body?.payload?.data?.interaction?.callAssociatedData,
+    body?.payload?.data?.interaction?.callassociateddata,
+    body?.payload?.interaction?.callAssociatedData,
+    body?.payload?.interaction?.callassociateddata,
+    body?.payload?.data?.callAssociatedData,
+    body?.payload?.data?.callassociateddata,
+    body?.payload?.callAssociatedData,
+    body?.payload?.callassociateddata
+  ].filter((value) => value && typeof value === "object");
+
+  return dedupeObjectReferences([
+    ...preferredSources,
+    ...findNestedObjectsByNormalizedKey(body, "callassociateddata"),
+    ...findNestedObjectsByNormalizedKey(body, "calldetail"),
+    ...findNestedObjectsByNormalizedKey(body, "calldetails")
+  ]);
+}
+
+function dedupeObjectReferences(values) {
+  const seen = new Set();
+
+  return values.filter((value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    if (seen.has(value)) {
+      return false;
+    }
+
+    seen.add(value);
+    return true;
+  });
+}
+
+function readTrackedFieldValue({ body, trackedSources, fieldNames }) {
+  if (!Array.isArray(fieldNames) || fieldNames.length === 0) {
+    return null;
+  }
+
+  for (const fieldName of fieldNames) {
+    for (const trackedSource of trackedSources) {
+      const value = readCallAssociatedDataValue(trackedSource, fieldName);
+
+      if (value !== null) {
+        return value;
+      }
+    }
+
+    const [nestedValue] = findNestedValuesByNormalizedKey(body, normalizeKeyName(fieldName));
+
+    if (nestedValue !== undefined) {
+      return nestedValue;
+    }
+  }
+
+  return null;
+}
+
 function readCallAssociatedDataValue(callAssociatedData, fieldName) {
   if (!fieldName || !callAssociatedData || typeof callAssociatedData !== "object") {
     return null;
   }
 
-  const value = callAssociatedData[fieldName];
+  const value = resolveCallAssociatedDataFieldValue(callAssociatedData, fieldName);
 
   if (value === undefined || value === null) {
     return null;
@@ -597,6 +834,24 @@ function readCallAssociatedDataValue(callAssociatedData, fieldName) {
   }
 
   return normalizeTrackedFieldValue(value);
+}
+
+function resolveCallAssociatedDataFieldValue(callAssociatedData, fieldName) {
+  if (fieldName in callAssociatedData) {
+    return callAssociatedData[fieldName];
+  }
+
+  const normalizedFieldName = normalizeKeyName(fieldName);
+  const directEntry = Object.entries(callAssociatedData).find(
+    ([key]) => normalizeKeyName(key) === normalizedFieldName
+  );
+
+  if (directEntry) {
+    return directEntry[1];
+  }
+
+  const [nestedValue] = findNestedValuesByNormalizedKey(callAssociatedData, normalizedFieldName);
+  return nestedValue ?? null;
 }
 
 function normalizeTrackedFieldValue(value) {
@@ -641,31 +896,44 @@ function attachTrackedCallAssociatedData(body, trackedCallAssociatedData) {
   };
 }
 
-function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecycleState }) {
+function buildAriesNewCallPayload({ body, trackedCallAssociatedData, callLifecycleState, timeZone }) {
   const eventData = body?.payload?.data ?? {};
   const interaction = eventData?.interaction ?? {};
   const callProcessingDetails = interaction?.callProcessingDetails ?? {};
   const eventName = normalizeOptionalString(body?.eventName);
-  const interactionId = normalizeOptionalString(interaction?.interactionId);
-  const eventTime = eventData?.eventTime ?? null;
-  const isStartEvent = eventName === "eAgentOfferContact";
-  const isEndEvent = eventName === "eAgentContactEnded";
+  const interactionId = resolveInteractionId(body);
+  const eventTime = normalizeEpochTimeToIso(eventData?.eventTime, timeZone);
+  const isStartEvent = CALL_START_EVENT_NAMES.has(eventName);
+  const isEndEvent = CALL_END_EVENT_NAMES.has(eventName);
   const knownCallStartTime = interactionId
     ? callLifecycleState?.callStartTimeByInteractionId?.get?.(interactionId) ?? null
     : null;
 
-  if (interactionId && isStartEvent && eventTime !== null) {
+  if (interactionId && isStartEvent && eventTime !== null && !knownCallStartTime) {
     callLifecycleState?.callStartTimeByInteractionId?.set?.(interactionId, eventTime);
   }
 
+  const callStartTime = normalizeEpochTimeToIso(
+    knownCallStartTime ?? (isStartEvent ? eventTime : null),
+    timeZone
+  );
+  const callStopTime = normalizeEpochTimeToIso(isEndEvent ? eventTime : null, timeZone);
+  const userEmail = pickFirstString([
+    eventData?.agentEmailId,
+    body?.payload?.agentEmailId,
+    ...findNestedValuesByNormalizedKey(body, "agentemailid"),
+    ...findNestedValuesByNormalizedKey(body, "email")
+  ]);
+
   return {
     transactionId: interactionId,
-    userEmail: normalizeOptionalString(eventData?.agentEmailId),
-    loginId: normalizeOptionalString(eventData?.agentId),
-    loginName: normalizeOptionalString(eventData?.agentEmailId),
+    userEmail,
+    loginId:  "1234546789", //normalizeOptionalString(eventData?.agentId),
+    loginName: userEmail,
     callerPhnNum: normalizeOptionalString(callProcessingDetails?.ani),
-    callStartTime: isStartEvent ? eventTime : knownCallStartTime,
-    callEndTime: isEndEvent ? eventTime : null,
+    hostName: normalizeOptionalString(eventData?.hostName) ?? "Webex.com",
+    callStartTime: callStartTime,
+    callEndTime: callStopTime,
     consentRecComp: normalizeAriesFieldValue(trackedCallAssociatedData?.consentRecordingComplete),
     consentScrPlayedSw: normalizeAriesFieldValue(trackedCallAssociatedData?.consentScriptPlayed)
   };
@@ -780,6 +1048,39 @@ function findFirstNestedObjectByNormalizedKey(input, normalizedKey) {
   }
 }
 
+function findNestedObjectsByNormalizedKey(input, normalizedKey) {
+  const matches = [];
+  const seen = new WeakSet();
+
+  walk(input, 0);
+  return matches;
+
+  function walk(value, depth) {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (seen.has(value) || depth > 8) {
+      return;
+    }
+
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item, depth + 1));
+      return;
+    }
+
+    Object.entries(value).forEach(([key, currentValue]) => {
+      if (normalizeKeyName(key) === normalizedKey && currentValue && typeof currentValue === "object") {
+        matches.push(currentValue);
+      }
+
+      walk(currentValue, depth + 1);
+    });
+  }
+}
+
 function pickFirstString(values) {
   for (const value of values) {
     const normalizedValue = normalizeOptionalString(value);
@@ -802,6 +1103,17 @@ function normalizeOptionalString(value) {
   }
 
   return String(value);
+}
+
+function normalizeOptionalUrlString(value) {
+  const normalizedValue = normalizeOptionalString(value);
+
+  if (normalizedValue === null) {
+    return null;
+  }
+
+  const trimmedValue = normalizedValue.trim();
+  return trimmedValue === "" ? null : trimmedValue;
 }
 
 function validateCommandBasicAuth({ request, expectedUsername, expectedPassword }) {
@@ -868,28 +1180,92 @@ function validateCommandBasicAuth({ request, expectedUsername, expectedPassword 
 
 function normalizeAriesFieldValue(value) {
   if (value === undefined || value === null || value === "") {
-    return null;
+    return "N";
+  }
+
+  if (value === true) {
+    return "Y";
+  }
+
+  if (value === false) {
+    return "N";
   }
 
   if (typeof value === "string") {
     const trimmedValue = value.trim();
 
-    if (trimmedValue === "") {
-      return null;
-    }
-
-    if (trimmedValue.toLowerCase() === "true") {
-      return true;
-    }
-
-    if (trimmedValue.toLowerCase() === "false") {
-      return false;
+    if (trimmedValue === "" || trimmedValue === null) {
+      return "N";
     }
 
     return trimmedValue;
   }
 
   return value;
+}
+
+function normalizeEpochTimeToIso(value, timeZone = "UTC") {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  if (typeof value === "number" || (typeof value === "string" && /^\d+$/.test(value.trim()))) {
+    const numericValue = Number(value);
+
+    if (!Number.isFinite(numericValue)) {
+      return null;
+    }
+
+    const epochMilliseconds = numericValue < 1e12 ? numericValue * 1000 : numericValue;
+    const parsedDate = new Date(epochMilliseconds);
+
+    if (Number.isNaN(parsedDate.getTime())) {
+      return null;
+    }
+
+    return formatIsoTimeInZone(parsedDate, timeZone);
+  }
+
+  const parsedDate = new Date(String(value));
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return String(value);
+  }
+
+  return formatIsoTimeInZone(parsedDate, timeZone);
+}
+
+function formatIsoTimeInZone(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date).reduce((result, part) => {
+    result[part.type] = part.value;
+    return result;
+  }, {});
+  const localTime = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(date.getUTCMilliseconds()).padStart(3, "0")}`;
+  const localTimestamp = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second),
+    date.getUTCMilliseconds()
+  );
+  const offsetMinutes = Math.round((localTimestamp - date.getTime()) / 60000);
+  const offsetSign = offsetMinutes < 0 ? "-" : "+";
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffsetMinutes / 60)).padStart(2, "0");
+  const remainingOffsetMinutes = String(absoluteOffsetMinutes % 60).padStart(2, "0");
+
+  return `${localTime}Z`;
 }
 
 function normalizeMountPath(input) {
@@ -929,6 +1305,73 @@ function findClientById(clients, clientId) {
   return null;
 }
 
+function startOrphanClientSweep({ clients, maxAgeMs, sweepIntervalMs }) {
+  if (!(clients instanceof Set) || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+    return null;
+  }
+
+  if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs <= 0) {
+    return null;
+  }
+
+  const timer = setInterval(() => {
+    const now = Date.now();
+
+    for (const client of clients) {
+      if (hasRegisteredDesktopIdentity(client)) {
+        continue;
+      }
+
+      const connectedAt = Number.isFinite(client?.connectedAt) ? client.connectedAt : now;
+
+      if (now - connectedAt < maxAgeMs) {
+        continue;
+      }
+
+      clients.delete(client);
+      logWarn("Purged orphaned desktop client", {
+        clientId: client?.id ?? null,
+        connectedAt: connectedAt ? new Date(connectedAt).toISOString() : null,
+        ageMs: now - connectedAt,
+        connectedClients: clients.size,
+        reason: "missing-agent-id"
+      });
+
+      try {
+        client?.response?.end?.();
+      } catch {
+        // Ignore response close failures during orphan cleanup.
+      }
+    }
+  }, sweepIntervalMs);
+
+  timer.unref?.();
+  return timer;
+}
+
+function listConnectedClientIdentities(clients) {
+  return Array.from(clients).map((client) => ({
+    clientId: client.id,
+    agentId: client.agentId,
+    agentAliases: client.agentAliases,
+    taskIds: client.taskIds,
+    interactionIds: client.interactionIds
+  }));
+}
+
+function hasRegisteredDesktopIdentity(client) {
+  if (!client || typeof client !== "object") {
+    return false;
+  }
+
+  return Boolean(
+    client.agentId
+    || client.agentAliases?.length
+    || client.taskIds?.length
+    || client.interactionIds?.length
+  );
+}
+
 function normalizeIdentityValue(value) {
   if (value === undefined || value === null || value === "") {
     return null;
@@ -959,10 +1402,12 @@ function getCommandTarget(command) {
   const target = command?.target ?? {};
   const agentId = normalizeIdentityValue(command?.agentId ?? target.agentId);
   const taskId = normalizeIdentityValue(command?.taskId ?? target.taskId);
+  const interactionId = normalizeIdentityValue(command?.interactionId ?? target.interactionId);
 
   return {
     agentId,
-    taskId
+    taskId,
+    interactionId
   };
 }
 
@@ -970,7 +1415,7 @@ function selectCommandTargets(clients, command) {
   const allClients = Array.from(clients);
   const target = getCommandTarget(command);
 
-  if (!target.agentId && !target.taskId) {
+  if (!target.agentId && !target.taskId && !target.interactionId) {
     return allClients;
   }
 
@@ -987,12 +1432,16 @@ function selectCommandTargets(clients, command) {
       return true;
     }
 
+    if (target.interactionId && client.interactionIds.includes(target.interactionId)) {
+      return true;
+    }
+
     return false;
   });
 }
 
-function buildDesktopBootstrapScript(configPath, entryPath) {
-  var versionQuery = new URLSearchParams({ v: arguments[2] || "" }).toString();
+function buildDesktopBootstrapScript(configPath, entryPath, assetVersion) {
+  var versionQuery = new URLSearchParams({ v: assetVersion || "" }).toString();
   var resolvedConfigPath = versionQuery ? `${configPath}?${versionQuery}` : configPath;
   var resolvedEntryPath = versionQuery ? `${entryPath}?${versionQuery}` : entryPath;
   return `(function bootstrapArkWidget() {
@@ -1395,7 +1844,14 @@ async function transcodeUploadPayloadToWav(body) {
 
 async function transcodeAudioBufferToWav(inputBuffer) {
   return await new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", [
+    const ffmpegBinary = resolveFfmpegBinary();
+
+    if (!ffmpegBinary) {
+      reject(new Error("ffmpeg binary is not configured or available."));
+      return;
+    }
+
+    const ffmpeg = spawn(ffmpegBinary, [
       "-hide_banner",
       "-loglevel",
       "error",
@@ -1436,6 +1892,20 @@ async function transcodeAudioBufferToWav(inputBuffer) {
     ffmpeg.stdin.on("error", () => {});
     ffmpeg.stdin.end(inputBuffer);
   });
+}
+
+function resolveFfmpegBinary() {
+  const configuredPath = normalizeOptionalString(process.env.FFMPEG_PATH);
+
+  if (configuredPath) {
+    return configuredPath;
+  }
+
+  if (typeof ffmpegStatic === "string" && ffmpegStatic.trim()) {
+    return ffmpegStatic;
+  }
+
+  return "ffmpeg";
 }
 
 function isWavBuffer(buffer) {
