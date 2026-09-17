@@ -50,7 +50,7 @@ export class AriesApiClient {
     //const extraBody = isPlainObject(delivery.extraBody) ? delivery.extraBody : {};
     const metadata = isPlainObject(captureResult?.metadata) ? captureResult.metadata : {};
     const body = {
-      dialogId: firstNonEmptyValue(metadata.dialogId, metadata.interactionId),
+      dialogId: "12334555",
       docTypeId: metadata.docTypeId ?? 1026,
       docTypeName: firstNonEmptyValue(metadata.docTypeName, "Telephonic Signature Recording"),
       receivedDt: firstNonEmptyValue(metadata.receivedDt, formatTodayDate()),
@@ -144,7 +144,7 @@ function firstNonEmptyValue(...values) {
 }
 
 function formatTodayDate() {
-  return new Date().toISOString();
+  return new Date().toISOString().replace("T", " ").replace("Z", "");
 }
 
 function isPlainObject(value) {
