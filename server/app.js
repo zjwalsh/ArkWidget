@@ -2,6 +2,7 @@ import express from "express";
 import ffmpegStatic from "ffmpeg-static";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildRequestContext, logDebug, logError, logInfo, logWarn } from "./logger.js";
@@ -992,7 +993,7 @@ function findNestedValuesByNormalizedKey(input, normalizedKey) {
     }
 
     Object.entries(value).forEach(([key, currentValue]) => {
-      if (normalizeKeyName(key) === normalizedKey) {
+      if (normalizeKeyName(key) === normalizedKey && (!currentValue || typeof currentValue !== "object")) {
         const normalizedValue = normalizeOptionalString(currentValue);
 
         if (normalizedValue) {
@@ -1843,55 +1844,66 @@ async function transcodeUploadPayloadToWav(body) {
 }
 
 async function transcodeAudioBufferToWav(inputBuffer) {
-  return await new Promise((resolve, reject) => {
-    const ffmpegBinary = resolveFfmpegBinary();
+  const outputPath = path.join(
+    os.tmpdir(),
+    `ark-widget-transcode-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.wav`
+  );
 
-    if (!ffmpegBinary) {
-      reject(new Error("ffmpeg binary is not configured or available."));
-      return;
-    }
+  try {
+    await new Promise((resolve, reject) => {
+      const ffmpegBinary = resolveFfmpegBinary();
 
-    const ffmpeg = spawn(ffmpegBinary, [
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      "pipe:0",
-      "-vn",
-      "-acodec",
-      "pcm_s16le",
-      "-f",
-      "wav",
-      "pipe:1"
-    ]);
-    const stdoutChunks = [];
-    const stderrChunks = [];
-
-    ffmpeg.stdout.on("data", (chunk) => {
-      stdoutChunks.push(chunk);
-    });
-
-    ffmpeg.stderr.on("data", (chunk) => {
-      stderrChunks.push(chunk);
-    });
-
-    ffmpeg.on("error", (error) => {
-      reject(new Error(`ffmpeg process failed to start: ${error.message}`));
-    });
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
-        resolve(Buffer.concat(stdoutChunks));
+      if (!ffmpegBinary) {
+        reject(new Error("ffmpeg binary is not configured or available."));
         return;
       }
 
-      const stderrOutput = Buffer.concat(stderrChunks).toString("utf8").trim();
-      reject(new Error(stderrOutput || `ffmpeg exited with code ${code}`));
+      const ffmpeg = spawn(ffmpegBinary, [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "8000",
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        "-y",
+        outputPath
+      ]);
+      const stderrChunks = [];
+
+      ffmpeg.stderr.on("data", (chunk) => {
+        stderrChunks.push(chunk);
+      });
+
+      ffmpeg.on("error", (error) => {
+        reject(new Error(`ffmpeg process failed to start: ${error.message}`));
+      });
+
+      ffmpeg.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+
+        const stderrOutput = Buffer.concat(stderrChunks).toString("utf8").trim();
+        reject(new Error(stderrOutput || `ffmpeg exited with code ${code}`));
+      });
+
+      ffmpeg.stdin.on("error", () => {});
+      ffmpeg.stdin.end(inputBuffer);
     });
 
-    ffmpeg.stdin.on("error", () => {});
-    ffmpeg.stdin.end(inputBuffer);
-  });
+    return await fs.readFile(outputPath);
+  } finally {
+    await fs.unlink(outputPath).catch(() => {});
+  }
 }
 
 function resolveFfmpegBinary() {

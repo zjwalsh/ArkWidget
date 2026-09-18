@@ -60,7 +60,7 @@ export class MediaCaptureService {
     return {
       source: source.description,
       signal,
-      fileName: options.fileName ?? buildFileName(blob.type),
+      fileName: options.fileName ?? buildFileName(blob.type, options.metadata),
       mimeType: blob.type || "audio/webm",
       sizeBytes: blob.size,
       durationMs,
@@ -136,17 +136,18 @@ export class MediaCaptureService {
     const blob = new Blob(chunks, { type: mimeType });
     const audioBase64 = await blobToBase64(blob);
     const durationMs = Date.now() - startedAt;
+    const metadata = mergeCaptureMetadata(startedOptions.metadata, options.metadata);
 
     const completedCapture = {
       source: source.description,
       signal,
-      fileName: options.fileName ?? startedOptions.fileName ?? buildFileName(blob.type),
+      fileName: options.fileName ?? startedOptions.fileName ?? buildFileName(blob.type, metadata),
       mimeType: blob.type || "audio/webm",
       sizeBytes: blob.size,
       durationMs,
       startedAt: new Date(startedAt).toISOString(),
       stoppedAt: new Date().toISOString(),
-      metadata: mergeCaptureMetadata(startedOptions.metadata, options.metadata),
+      metadata,
       audioBase64
     };
 
@@ -582,10 +583,27 @@ function blobToBase64(blob) {
   });
 }
 
-function buildFileName(mimeType) {
+function buildFileName(mimeType, metadata) {
   const extension = mimeType.includes("ogg") ? "ogg" : "webm";
+  const identifier = isPlainObject(metadata)
+    ? metadata.dialogId ?? metadata.interactionId
+    : null;
+
+  if (identifier) {
+    return `${sanitizeFileStem(identifier)}.${extension}`;
+  }
+
   const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
   return `signature-${timestamp}.${extension}`;
+}
+
+function sanitizeFileStem(value) {
+  const stem = String(value)
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-z0-9_-]+/gi, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return stem || "capture";
 }
 
 function buildSelectorDescriptor(element, index) {

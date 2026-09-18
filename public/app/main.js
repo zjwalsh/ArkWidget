@@ -9,9 +9,7 @@ const config = getWidgetConfig();
 const CALL_LIFECYCLE_EVENT_NAMES = new Set([
   "eAgentOfferContact",
   "eAgentContact",
-  "eAgentContactEnded",
   "eAgentWrapup",
-  "eAgentContactWrappedUp",
   "eAgentConsultTransferring",
   "eContactOwnerChanged"
 ]);
