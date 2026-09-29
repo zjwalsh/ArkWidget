@@ -410,7 +410,7 @@ export function createArkWidgetApp(options = {}) {
         callLifecycleState,
         timeZone: ariesTimeZone
       })
-      : trackedForwardContext.forwardBody;
+      : body;
     let finalForwardBody = transformedBody;
 
     if (endpoint === ariesRecordTransactionEndpoint) {
@@ -557,7 +557,8 @@ export function createArkWidgetApp(options = {}) {
         endpoint,
         method,
         upstreamStatus: upstreamResponse.status,
-        durationMs: Date.now() - startedAt
+        durationMs: Date.now() - startedAt,
+        upstreamResponseBody: truncateForLogging(responseText)
       });
       response.status(upstreamResponse.status);
       response.type(contentType);
@@ -1096,6 +1097,16 @@ function pickFirstString(values) {
 
 function normalizeKeyName(value) {
   return String(value).replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function truncateForLogging(value, maxLength = 2000) {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  return value.length > maxLength
+    ? `${value.slice(0, maxLength)}...[truncated ${value.length - maxLength} chars]`
+    : value;
 }
 
 function normalizeOptionalString(value) {
