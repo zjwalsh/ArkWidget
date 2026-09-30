@@ -12,6 +12,7 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.resolve(__dirname, "../public");
 const nodeModulesDir = path.resolve(__dirname, "../node_modules");
 const recordingsDir = path.resolve(__dirname, "../logs/recordings");
+const rawUploadAudioDir = path.resolve(__dirname, "../logs/recordings/raw");
 const commandResultsDir = path.resolve(__dirname, "../logs/command-results");
 const widgetAssetVersion = Date.now().toString();
 const CALL_START_EVENT_NAMES = new Set([
@@ -51,6 +52,10 @@ export function createArkWidgetApp(options = {}) {
     ?? process.env.ARIES_COMMAND_PASSWORD
   );
   const requiresCommandAuth = Boolean(ariesCommandUsername || ariesCommandPassword);
+  const debugSaveRawUploadAudio = parseBooleanFlag(
+    options.debugSaveRawUploadAudio
+    ?? process.env.DEBUG_SAVE_RAW_UPLOAD_AUDIO
+  );
   const ariesTimeoutMs = Number.parseInt(
     String(
       options.ariesTimeoutMs
@@ -426,6 +431,21 @@ export function createArkWidgetApp(options = {}) {
     }
 
     if (useUploadApi) {
+      if (debugSaveRawUploadAudio) {
+        const savedRawUploadAudio = await maybeSaveRawUploadAudio({
+          body: transformedBody,
+          rawUploadAudioDir,
+          requestId: request.requestId
+        });
+
+        logInfo("Saved raw pre-transcode upload audio", {
+          ...buildRequestContext(request),
+          endpoint,
+          method,
+          savedRawUploadAudioPath: savedRawUploadAudio?.filePath ?? null
+        });
+      }
+
       try {
         finalForwardBody = await transcodeUploadPayloadToWav(transformedBody);
       } catch (error) {
@@ -1128,6 +1148,11 @@ function normalizeOptionalUrlString(value) {
   return trimmedValue === "" ? null : trimmedValue;
 }
 
+function parseBooleanFlag(value) {
+  const normalizedValue = normalizeOptionalString(value)?.toLowerCase();
+  return normalizedValue === "true" || normalizedValue === "1" || normalizedValue === "yes";
+}
+
 function validateCommandBasicAuth({ request, expectedUsername, expectedPassword }) {
   if (!expectedUsername || !expectedPassword) {
     return {
@@ -1733,6 +1758,25 @@ function normalizePublicOrigin(value) {
   }
 
   return value.trim().replace(/\/$/, "");
+}
+
+async function maybeSaveRawUploadAudio({ body, rawUploadAudioDir, requestId }) {
+  const docBlob = body?.docBlob;
+
+  if (typeof docBlob !== "string" || docBlob.length === 0) {
+    return null;
+  }
+
+  await fs.mkdir(rawUploadAudioDir, { recursive: true });
+
+  const baseName = sanitizeFileStem(
+    `${normalizeOptionalString(body?.dialogId) ?? "capture"}-${requestId ?? crypto.randomUUID()}-raw`
+  );
+  const filePath = path.join(rawUploadAudioDir, `${baseName}.webm`);
+
+  await fs.writeFile(filePath, Buffer.from(docBlob, "base64"));
+
+  return { filePath };
 }
 
 async function maybePersistCapturedAudio({ body, recordingsDir, requestId }) {
