@@ -82,13 +82,14 @@ export class AriesApiClient {
 
   async forward(payload) {
     const body = safeJsonStringify(payload);
+    const attempts = payload?.useUploadApi ? 1 : 2;
     const response = await fetchWithRetry(this.forwardPath, {
       method: "POST",
       headers: {
         "content-type": "application/json"
       },
       body
-    });
+    }, attempts);
 
     const text = await response.text();
     const data = tryParseJson(text);

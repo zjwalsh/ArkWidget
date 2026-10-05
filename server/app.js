@@ -64,6 +64,14 @@ export function createArkWidgetApp(options = {}) {
     ),
     10
   );
+  const ariesUploadTimeoutMs = Number.parseInt(
+    String(
+      options.ariesUploadTimeoutMs
+      ?? process.env.ARIES_API_UPLOAD_TIMEOUT_MS
+      ?? "60000"
+    ),
+    10
+  );
   const ariesNewCallEndpoint = options.ariesNewCallEndpoint
     ?? process.env.ARIES_NEW_CALL_ENDPOINT
     ?? "/contact-arrivals";
@@ -547,15 +555,16 @@ export function createArkWidgetApp(options = {}) {
     const url = useUploadApi
       ? new URL(destinationBaseUrl)
       : resolveAriesUrl(destinationBaseUrl, endpoint);
+    const requestTimeoutMs = useUploadApi ? ariesUploadTimeoutMs : ariesTimeoutMs;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), ariesTimeoutMs);
+    const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
     const startedAt = Date.now();
 
     logInfo("Forwarding request to Aries", {
       ...buildRequestContext(request),
       endpoint,
       method,
-      timeoutMs: ariesTimeoutMs
+      timeoutMs: requestTimeoutMs
     });
 
     try {
@@ -585,7 +594,7 @@ export function createArkWidgetApp(options = {}) {
       response.send(responseText);
     } catch (error) {
       const message = error?.name === "AbortError"
-        ? `Aries request timed out after ${ariesTimeoutMs}ms.`
+        ? `Aries request timed out after ${requestTimeoutMs}ms.`
         : error instanceof Error
           ? error.message
           : "Unknown Aries forwarding error.";

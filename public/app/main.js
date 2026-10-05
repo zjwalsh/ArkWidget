@@ -80,7 +80,13 @@ async function bootstrap() {
       try {
         await handleCallLifecycleEvent(event);
       } catch (error) {
-        showCommand({ callLifecycleWebhookError: error.message });
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        showCommand({ callLifecycleWebhookError: errorMessage });
+        void reportClientDiagnostic("ERROR", "call-lifecycle-webhook-failed", errorMessage, {
+          eventName: event?.eventName ?? null,
+          interactionId: resolveCurrentInteractionId(),
+          stack: error?.stack ?? null
+        });
       }
     }
 
